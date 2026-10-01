@@ -1,0 +1,6 @@
+[submodule "vendor/quickjs"]
+	path = vendor/quickjs
+	url = https://github.com/bellard/quickjs.git
+[submodule "vendor/sqlite"]
+	path = vendor/sqlite
+	url = https://github.com/azadkuh/sqlite-amalgamation.git
