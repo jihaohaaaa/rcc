@@ -35,15 +35,17 @@ fn run_fixture_file_with_args(rel_path: &str, args: &[&str], expected_exit_code:
                 .unwrap_or_else(|| panic!("Compilation failed for {:?}:\n{}", c_file, diag.render_to_string(c_file.to_str().unwrap(), &source)));
 
     let asm_file = tempfile::Builder::new().suffix(".s").tempfile().unwrap();
-    std::fs::write(asm_file.path(), &asm).unwrap();
+    let asm_path = asm_file.into_temp_path();
+    std::fs::write(&asm_path, &asm).unwrap();
 
     let exe_file = tempfile::Builder::new().suffix(".out").tempfile().unwrap();
+    let exe_path = exe_file.into_temp_path();
 
     let mut cmd = Command::new("clang");
     cmd.arg("-x").arg("assembler");
-    cmd.arg(asm_file.path());
+    cmd.arg(&asm_path);
     cmd.arg("-lm");
-    cmd.arg("-o").arg(exe_file.path());
+    cmd.arg("-o").arg(&exe_path);
 
     let build_output = cmd.output().expect("Failed to execute clang assembler");
     if !build_output.status.success() {
@@ -51,7 +53,7 @@ fn run_fixture_file_with_args(rel_path: &str, args: &[&str], expected_exit_code:
         panic!("Clang assembly failed:\n{}", err);
     }
 
-    let mut run_cmd = Command::new(exe_file.path());
+    let mut run_cmd = Command::new(&exe_path);
     for a in &args_owned {
         run_cmd.arg(a);
     }
@@ -66,7 +68,7 @@ fn run_fixture_file_with_args(rel_path: &str, args: &[&str], expected_exit_code:
             .arg("-b")
             .arg("-o").arg("target stop-hook add -o 'register read lr' -o 'bt'")
             .arg("-o").arg("process launch")
-            .arg(exe_file.path())
+            .arg(&exe_path)
             .output();
         let bt = if let Ok(o) = lldb_out {
             String::from_utf8_lossy(&o.stdout).to_string()

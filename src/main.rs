@@ -44,6 +44,14 @@ struct Cli {
     /// Add directory to library search path
     #[arg(short = 'L', value_name = "DIR", action = clap::ArgAction::Append)]
     library_dirs: Vec<PathBuf>,
+
+    /// Target architecture (e.g. x86_64, aarch64)
+    #[arg(long, value_name = "TARGET")]
+    target: Option<String>,
+
+    /// Target architecture shortcut (e.g. -m64, -m32)
+    #[arg(short = 'm', value_name = "ARCH")]
+    m_arch: Option<String>,
 }
 
 fn main() {
@@ -58,6 +66,20 @@ fn main() {
         }
     }
 
+    let target = cli.target.or_else(|| {
+        if let Some(m) = cli.m_arch {
+            if m == "64" || m == "x86_64" || m == "x86-64" {
+                Some("x86_64".to_string())
+            } else if m == "aarch64" || m == "arm64" {
+                Some("aarch64".to_string())
+            } else {
+                Some(m)
+            }
+        } else {
+            None
+        }
+    });
+
     let options = CompilerOptions {
         input_file: cli.input,
         output_file: cli.output,
@@ -68,6 +90,7 @@ fn main() {
         emit_assembly: cli.assembly_only,
         emit_preprocessor: cli.preprocess_only,
         compile_only: cli.compile_only,
+        target,
     };
 
     let driver = Driver::new(options);

@@ -383,12 +383,14 @@ impl Sema {
             }
             Stmt::Return(expr_opt, span) => {
                 let typed_expr = expr_opt.map(|e| {
-                    let te = self.analyze_expr(e, diag);
+                    let mut te = self.analyze_expr(e, diag);
                     if let Some(ret_ty) = &self.current_func_ret_type
                         && te.ty != *ret_ty
-                        && ret_ty.is_integer()
+                        && !ret_ty.is_struct()
+                        && !ret_ty.is_union()
+                        && !ret_ty.is_array()
                     {
-                        return TypedExpr {
+                        te = TypedExpr {
                             kind: TypedExprKind::Cast { expr: Box::new(te) },
                             ty: ret_ty.clone(),
                             span,
@@ -642,7 +644,14 @@ impl Sema {
                     return;
                 }
 
-                let te = self.analyze_expr(*expr.clone(), diag);
+                let mut te = self.analyze_expr(*expr.clone(), diag);
+                if te.ty != *ty && !ty.is_struct() && !ty.is_union() && !ty.is_array() {
+                    te = TypedExpr {
+                        kind: TypedExprKind::Cast { expr: Box::new(te) },
+                        ty: ty.clone(),
+                        span,
+                    };
+                }
                 let assign = TypedExpr {
                     kind: TypedExprKind::Binary {
                         op: BinaryOp::Assign,
@@ -790,7 +799,22 @@ impl Sema {
                 let mut trhs = self.analyze_expr(*rhs, diag);
 
                 let ty = match op {
-                    BinaryOp::Assign => tlhs.ty.clone(),
+                    BinaryOp::Assign => {
+                        if tlhs.ty != trhs.ty
+                            && !tlhs.ty.is_struct()
+                            && !tlhs.ty.is_union()
+                            && !tlhs.ty.is_array()
+                        {
+                            trhs = TypedExpr {
+                                kind: TypedExprKind::Cast {
+                                    expr: Box::new(trhs),
+                                },
+                                ty: tlhs.ty.clone(),
+                                span,
+                            };
+                        }
+                        tlhs.ty.clone()
+                    }
                     BinaryOp::PlusAssign
                     | BinaryOp::MinusAssign
                     | BinaryOp::StarAssign
@@ -1129,9 +1153,68 @@ impl Sema {
                 span,
             } => {
                 let tcond = self.analyze_expr(*cond, diag);
-                let tthen = self.analyze_expr(*then_expr, diag);
-                let telse = self.analyze_expr(*else_expr, diag);
-                let ty = tthen.ty.clone();
+                let mut tthen = self.analyze_expr(*then_expr, diag);
+                let mut telse = self.analyze_expr(*else_expr, diag);
+                let ty = if !tthen.ty.is_pointer()
+                    && !tthen.ty.is_array()
+                    && !telse.ty.is_pointer()
+                    && !telse.ty.is_array()
+                    && !tthen.ty.is_struct()
+                    && !tthen.ty.is_union()
+                    && !telse.ty.is_struct()
+                    && !telse.ty.is_union()
+                {
+                    let common = common_arithmetic_type(&tthen.ty, &telse.ty);
+                    if tthen.ty != common {
+                        tthen = TypedExpr {
+                            kind: TypedExprKind::Cast {
+                                expr: Box::new(tthen),
+                            },
+                            ty: common.clone(),
+                            span,
+                        };
+                    }
+                    if telse.ty != common {
+                        telse = TypedExpr {
+                            kind: TypedExprKind::Cast {
+                                expr: Box::new(telse),
+                            },
+                            ty: common.clone(),
+                            span,
+                        };
+                    }
+                    common
+                } else if (tthen.ty.is_pointer() || tthen.ty.is_array()) && telse.ty.is_integer() {
+                    let ty = if tthen.ty.is_array() {
+                        tthen.ty.get_pointer_base().unwrap().clone().pointer_to()
+                    } else {
+                        tthen.ty.clone()
+                    };
+                    telse = TypedExpr {
+                        kind: TypedExprKind::Cast {
+                            expr: Box::new(telse),
+                        },
+                        ty: ty.clone(),
+                        span,
+                    };
+                    ty
+                } else if (telse.ty.is_pointer() || telse.ty.is_array()) && tthen.ty.is_integer() {
+                    let ty = if telse.ty.is_array() {
+                        telse.ty.get_pointer_base().unwrap().clone().pointer_to()
+                    } else {
+                        telse.ty.clone()
+                    };
+                    tthen = TypedExpr {
+                        kind: TypedExprKind::Cast {
+                            expr: Box::new(tthen),
+                        },
+                        ty: ty.clone(),
+                        span,
+                    };
+                    ty
+                } else {
+                    tthen.ty.clone()
+                };
                 TypedExpr {
                     kind: TypedExprKind::Ternary {
                         cond: Box::new(tcond),
@@ -1181,19 +1264,39 @@ impl Sema {
                     other => self.analyze_expr(other, diag),
                 };
 
-                let mut targs = Vec::new();
-                for a in args {
-                    targs.push(self.analyze_expr(a, diag));
-                }
-
-                let ret_ty = match &tcallee.ty.kind {
-                    TypeKind::Function { ret, .. } => *ret.clone(),
+                let (ret_ty, params_opt) = match &tcallee.ty.kind {
+                    TypeKind::Function { ret, params, .. } => (*ret.clone(), Some(params.clone())),
                     TypeKind::Pointer(base) => match &base.kind {
-                        TypeKind::Function { ret, .. } => *ret.clone(),
-                        _ => Type::int_ty(),
+                        TypeKind::Function { ret, params, .. } => {
+                            (*ret.clone(), Some(params.clone()))
+                        }
+                        _ => (Type::int_ty(), None),
                     },
-                    _ => Type::int_ty(),
+                    _ => (Type::int_ty(), None),
                 };
+
+                let mut targs = Vec::new();
+                for (i, a) in args.into_iter().enumerate() {
+                    let mut ta = self.analyze_expr(a, diag);
+                    if let Some(params) = &params_opt
+                        && i < params.len()
+                    {
+                        let target_ty = &params[i];
+                        if ta.ty != *target_ty
+                            && !target_ty.is_struct()
+                            && !target_ty.is_union()
+                            && !target_ty.is_array()
+                        {
+                            let span = ta.span;
+                            ta = TypedExpr {
+                                kind: TypedExprKind::Cast { expr: Box::new(ta) },
+                                ty: target_ty.clone(),
+                                span,
+                            };
+                        }
+                    }
+                    targs.push(ta);
+                }
 
                 TypedExpr {
                     kind: TypedExprKind::Call {
@@ -1438,6 +1541,11 @@ fn common_arithmetic_type(lhs: &Type, rhs: &Type) -> Type {
 
 pub fn builtin_signature(name: &str) -> Option<Type> {
     match name {
+        "__builtin_va_start" | "__builtin_va_end" => Some(Type::new(TypeKind::Function {
+            ret: Box::new(Type::void()),
+            params: Vec::new(),
+            is_variadic: true,
+        })),
         "__builtin_frame_address" | "__builtin_return_address" | "__builtin_alloca" | "alloca" => {
             Some(Type::new(TypeKind::Function {
                 ret: Box::new(Type::void_ptr_ty()),

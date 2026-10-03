@@ -1,4 +1,4 @@
-use crate::codegen::{AArch64Emitter, TargetEmitter};
+use crate::codegen::{AArch64Emitter, TargetEmitter, X86_64Emitter};
 use crate::diag::Diagnostics;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
@@ -18,6 +18,7 @@ pub struct CompilerOptions {
     pub emit_assembly: bool,
     pub emit_preprocessor: bool,
     pub compile_only: bool,
+    pub target: Option<String>,
 }
 
 pub struct Driver {
@@ -35,8 +36,42 @@ impl Driver {
         filename: &str,
         diag: &mut Diagnostics,
     ) -> Option<String> {
+        // Determine target architecture
+        let target_arch = match self.options.target.as_deref() {
+            Some("x86_64" | "x86-64" | "x64" | "amd64" | "x86" | "i386" | "i686") => "x86_64",
+            Some("aarch64" | "arm64" | "arm") => "aarch64",
+            Some(other) => {
+                diag.error(
+                    crate::span::Span::new(0, 0),
+                    format!("Unsupported target architecture: '{}'", other),
+                );
+                return None;
+            }
+            None => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    "x86_64"
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    "aarch64"
+                }
+            }
+        };
+
         // 1. Preprocessor
         let mut pp = Preprocessor::new();
+
+        if target_arch == "x86_64" {
+            pp.define_object("__x86_64__", "1");
+            pp.define_object("__x86_64", "1");
+            pp.define_object("__amd64__", "1");
+            pp.define_object("__amd64", "1");
+        } else {
+            pp.define_object("__aarch64__", "1");
+            pp.define_object("__arm64__", "1");
+            pp.define_object("__arm64", "1");
+        }
 
         // Add user-specified include directories
         for dir in &self.options.include_dirs {
@@ -111,8 +146,11 @@ impl Driver {
         }
 
         // 5. Codegen
-        eprintln!("[RSCC] Starting Codegen...");
-        let mut emitter = AArch64Emitter::new();
+        eprintln!("[RSCC] Starting Codegen for target {}...", target_arch);
+        let mut emitter: Box<dyn TargetEmitter> = match target_arch {
+            "x86_64" => Box::new(X86_64Emitter::new()),
+            _ => Box::new(AArch64Emitter::new()),
+        };
         let asm = emitter.emit_program(&typed_ast);
         eprintln!("[RSCC] Finished Codegen: {} bytes asm", asm.len());
         Some(asm)

@@ -12,9 +12,9 @@ struct stat {
     uid_t     st_uid;
     gid_t     st_gid;
     dev_t     st_rdev;
-    struct timespec st_atimespec;
-    struct timespec st_mtimespec;
-    struct timespec st_ctimespec;
+    struct timespec st_atim;
+    struct timespec st_mtim;
+    struct timespec st_ctim;
     off_t     st_size;
     long      st_blocks;
     unsigned int st_blksize;
@@ -22,9 +22,13 @@ struct stat {
     unsigned int st_gen;
 };
 
-#define st_atime st_atimespec.tv_sec
-#define st_mtime st_mtimespec.tv_sec
-#define st_ctime st_ctimespec.tv_sec
+#define st_atimespec st_atim
+#define st_mtimespec st_mtim
+#define st_ctimespec st_ctim
+
+#define st_atime st_atim.tv_sec
+#define st_mtime st_mtim.tv_sec
+#define st_ctime st_ctim.tv_sec
 
 #define S_IFMT   0170000
 #define S_IFIFO  0010000

@@ -1,12 +1,12 @@
 [package]
 name = "rscc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "A fast and modular C compiler written in Rust targeting AArch64"
+description = "A fast and modular C compiler written in Rust targeting x86_64 and AArch64"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/jihaohaaaa/rcc"
-keywords = ["compiler", "c", "c99", "c11", "aarch64"]
+keywords = ["compiler", "c", "c99", "x86_64", "aarch64"]
 categories = ["development-tools", "compilers"]
 exclude = ["vendor/", "qjs_unity.c", "sqlite_unity.c", "sqlite3_cli_unity.c"]
 

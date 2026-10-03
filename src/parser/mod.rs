@@ -4,15 +4,15 @@ use crate::lexer::token::{Token, TokenKind};
 use crate::types::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 pub struct Parser<'a> {
     tokens: &'a [Token],
     cursor: usize,
     typedefs: Vec<HashMap<String, Type>>,
-    struct_tags: Vec<HashMap<String, Arc<RefCell<StructType>>>>,
-    union_tags: Vec<HashMap<String, Arc<RefCell<UnionType>>>>,
-    enum_tags: Vec<HashMap<String, Arc<EnumType>>>,
+    struct_tags: Vec<HashMap<String, Rc<RefCell<StructType>>>>,
+    union_tags: Vec<HashMap<String, Rc<RefCell<UnionType>>>>,
+    enum_tags: Vec<HashMap<String, Rc<EnumType>>>,
     enum_constants: Vec<HashMap<String, i64>>,
 }
 
@@ -779,7 +779,7 @@ impl<'a> Parser<'a> {
                         };
                         existing_st
                     } else {
-                        let st = Arc::new(RefCell::new(StructType {
+                        let st = Rc::new(RefCell::new(StructType {
                             tag: tag.clone(),
                             members,
                             size: total_size.max(1),
@@ -792,7 +792,7 @@ impl<'a> Parser<'a> {
                         st
                     }
                 } else {
-                    Arc::new(RefCell::new(StructType {
+                    Rc::new(RefCell::new(StructType {
                         tag: None,
                         members,
                         size: total_size.max(1),
@@ -814,7 +814,7 @@ impl<'a> Parser<'a> {
                         };
                         existing_ut
                     } else {
-                        let ut = Arc::new(RefCell::new(UnionType {
+                        let ut = Rc::new(RefCell::new(UnionType {
                             tag: tag.clone(),
                             members,
                             size: total_size.max(1),
@@ -827,7 +827,7 @@ impl<'a> Parser<'a> {
                         ut
                     }
                 } else {
-                    Arc::new(RefCell::new(UnionType {
+                    Rc::new(RefCell::new(UnionType {
                         tag: None,
                         members,
                         size: total_size.max(1),
@@ -844,7 +844,7 @@ impl<'a> Parser<'a> {
                         return Type::new(TypeKind::Struct(st.clone()));
                     }
                 }
-                let st = Arc::new(RefCell::new(StructType {
+                let st = Rc::new(RefCell::new(StructType {
                     tag: Some(t.clone()),
                     members: Vec::new(),
                     size: 0,
@@ -861,7 +861,7 @@ impl<'a> Parser<'a> {
                         return Type::new(TypeKind::Union(ut.clone()));
                     }
                 }
-                let ut = Arc::new(RefCell::new(UnionType {
+                let ut = Rc::new(RefCell::new(UnionType {
                     tag: Some(t.clone()),
                     members: Vec::new(),
                     size: 0,
@@ -932,7 +932,7 @@ impl<'a> Parser<'a> {
 
             self.expect(&TokenKind::RBrace, diag);
 
-            let et = Arc::new(EnumType {
+            let et = Rc::new(EnumType {
                 tag: tag.clone(),
                 variants,
             });

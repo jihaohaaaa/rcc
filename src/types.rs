@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
@@ -27,9 +27,9 @@ pub enum TypeKind {
         elem: Box<Type>,
         len: Option<usize>,
     },
-    Struct(Arc<RefCell<StructType>>),
-    Union(Arc<RefCell<UnionType>>),
-    Enum(Arc<EnumType>),
+    Struct(Rc<RefCell<StructType>>),
+    Union(Rc<RefCell<UnionType>>),
+    Enum(Rc<EnumType>),
     Function {
         ret: Box<Type>,
         params: Vec<Type>,

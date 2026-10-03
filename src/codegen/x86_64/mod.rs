@@ -6,24 +6,26 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-pub struct AArch64Emitter {
+pub struct X86_64Emitter {
     is_macos: bool,
     output: String,
     label_counter: usize,
     current_func: String,
     current_func_scratch_offset: usize,
+    current_func_va_offset: usize,
+    current_func_named_count: usize,
     loop_labels: Vec<(String, String)>, // (continue_label, break_label)
     depth: Cell<usize>,
     defined_globals: HashSet<String>,
 }
 
-impl Default for AArch64Emitter {
+impl Default for X86_64Emitter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AArch64Emitter {
+impl X86_64Emitter {
     pub fn new() -> Self {
         let is_macos = cfg!(target_os = "macos");
         Self {
@@ -32,6 +34,8 @@ impl AArch64Emitter {
             label_counter: 0,
             current_func: String::new(),
             current_func_scratch_offset: 0,
+            current_func_va_offset: 0,
+            current_func_named_count: 0,
             loop_labels: Vec::new(),
             depth: Cell::new(0),
             defined_globals: HashSet::new(),
@@ -67,40 +71,40 @@ impl AArch64Emitter {
     }
 
     fn push(&mut self) {
-        self.emit("str x0, [sp, #-16]!");
+        self.emit("push rax");
     }
 
     fn pop(&mut self, reg: &str) {
-        self.emit(&format!("ldr {}, [sp], #16", reg));
+        self.emit(&format!("pop {}", reg));
     }
 
     fn emit_load_imm(&mut self, reg: &str, val: i64) {
-        let u = val as u64;
-        if u == 0 {
-            self.emit(&format!("mov {}, #0", reg));
-            return;
-        }
-        let chunks = [
-            (u & 0xffff) as u16,
-            ((u >> 16) & 0xffff) as u16,
-            ((u >> 32) & 0xffff) as u16,
-            ((u >> 48) & 0xffff) as u16,
-        ];
-        let mut first = true;
-        for (i, &chunk) in chunks.iter().enumerate() {
-            if chunk != 0 {
-                let shift = i * 16;
-                if first {
-                    if shift == 0 {
-                        self.emit(&format!("movz {}, #{}", reg, chunk));
-                    } else {
-                        self.emit(&format!("movz {}, #{}, lsl #{}", reg, chunk, shift));
-                    }
-                    first = false;
-                } else {
-                    self.emit(&format!("movk {}, #{}, lsl #{}", reg, chunk, shift));
-                }
+        if val == 0 {
+            if reg == "rax" {
+                self.emit("xor eax, eax");
+            } else if reg == "rcx" {
+                self.emit("xor ecx, ecx");
+            } else if reg == "rdx" {
+                self.emit("xor edx, edx");
+            } else if reg == "rsi" {
+                self.emit("xor esi, esi");
+            } else if reg == "rdi" {
+                self.emit("xor edi, edi");
+            } else if reg == "r8" {
+                self.emit("xor r8d, r8d");
+            } else if reg == "r9" {
+                self.emit("xor r9d, r9d");
+            } else if reg == "r10" {
+                self.emit("xor r10d, r10d");
+            } else if reg == "r11" {
+                self.emit("xor r11d, r11d");
+            } else {
+                self.emit(&format!("mov {}, 0", reg));
             }
+        } else if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+            self.emit(&format!("mov {}, {}", reg, val));
+        } else {
+            self.emit(&format!("movabs {}, {}", reg, val));
         }
     }
 
@@ -120,26 +124,14 @@ impl AArch64Emitter {
     fn gen_lval_inner(&mut self, expr: &TypedExpr) {
         match &expr.kind {
             TypedExprKind::LocalVar(offset) => {
-                if *offset <= 4095 {
-                    self.emit(&format!("sub x0, fp, #{}", offset));
-                } else {
-                    self.emit_load_imm("x16", *offset as i64);
-                    self.emit("sub x0, fp, x16");
-                }
+                self.emit(&format!("lea rax, [rbp - {}]", offset));
             }
             TypedExprKind::GlobalVar(name) => {
                 let sym = self.symbol_name(name);
-                if self.is_macos {
-                    if self.defined_globals.contains(name) {
-                        self.emit(&format!("adrp x0, {}@PAGE", sym));
-                        self.emit(&format!("add x0, x0, {}@PAGEOFF", sym));
-                    } else {
-                        self.emit(&format!("adrp x0, {}@GOTPAGE", sym));
-                        self.emit(&format!("ldr x0, [x0, {}@GOTPAGEOFF]", sym));
-                    }
+                if self.defined_globals.contains(name) {
+                    self.emit(&format!("lea rax, [rip + {}]", sym));
                 } else {
-                    self.emit(&format!("adrp x0, {}", sym));
-                    self.emit(&format!("add x0, x0, :lo12:{}", sym));
+                    self.emit(&format!("mov rax, [rip + {}@GOTPCREL]", sym));
                 }
             }
             TypedExprKind::Deref(inner) => {
@@ -148,12 +140,7 @@ impl AArch64Emitter {
             TypedExprKind::Member { expr, offset, .. } => {
                 self.gen_lval(expr);
                 if *offset > 0 {
-                    if *offset <= 4095 {
-                        self.emit(&format!("add x0, x0, #{}", offset));
-                    } else {
-                        self.emit_load_imm("x16", *offset as i64);
-                        self.emit("add x0, x0, x16");
-                    }
+                    self.emit(&format!("add rax, {}", offset));
                 }
             }
             TypedExprKind::StmtExpr(stmts) => {
@@ -177,36 +164,33 @@ impl AArch64Emitter {
 
     fn load(&mut self, ty: &Type) {
         if ty.is_array() || ty.is_struct() || ty.is_union() || ty.is_function() {
-            // Arrays, structs, and functions decay to pointer address in x0
+            // Decays to pointer address in rax
             return;
         }
         match ty.size() {
             1 => {
                 if ty.is_signed_integer() {
-                    self.emit("ldrsb w0, [x0]");
+                    self.emit("movsx rax, byte ptr [rax]");
                 } else {
-                    self.emit("ldrb w0, [x0]");
+                    self.emit("movzx eax, byte ptr [rax]");
                 }
             }
             2 => {
                 if ty.is_signed_integer() {
-                    self.emit("ldrsh w0, [x0]");
+                    self.emit("movsx rax, word ptr [rax]");
                 } else {
-                    self.emit("ldrh w0, [x0]");
+                    self.emit("movzx eax, word ptr [rax]");
                 }
             }
             4 => {
                 if ty.is_signed_integer() {
-                    self.emit("ldrsw x0, [x0]");
+                    self.emit("movsxd rax, dword ptr [rax]");
                 } else {
-                    self.emit("ldr w0, [x0]");
+                    self.emit("mov eax, dword ptr [rax]");
                 }
             }
-            8 => {
-                self.emit("ldr x0, [x0]");
-            }
             _ => {
-                self.emit("ldr x0, [x0]");
+                self.emit("mov rax, [rax]");
             }
         }
     }
@@ -217,72 +201,65 @@ impl AArch64Emitter {
             if size <= 128 {
                 let mut offset = 0;
                 while offset + 8 <= size {
-                    self.emit(&format!("ldr x2, [x0, #{}]", offset));
-                    self.emit(&format!("str x2, [x1, #{}]", offset));
+                    self.emit(&format!("mov rdx, [rax + {}]", offset));
+                    self.emit(&format!("mov [rdi + {}], rdx", offset));
                     offset += 8;
                 }
                 if offset + 4 <= size {
-                    self.emit(&format!("ldr w2, [x0, #{}]", offset));
-                    self.emit(&format!("str w2, [x1, #{}]", offset));
+                    self.emit(&format!("mov edx, [rax + {}]", offset));
+                    self.emit(&format!("mov [rdi + {}], edx", offset));
                     offset += 4;
                 }
                 if offset + 2 <= size {
-                    self.emit(&format!("ldrh w2, [x0, #{}]", offset));
-                    self.emit(&format!("strh w2, [x1, #{}]", offset));
+                    self.emit(&format!("mov dx, [rax + {}]", offset));
+                    self.emit(&format!("mov [rdi + {}], dx", offset));
                     offset += 2;
                 }
                 if offset < size {
-                    self.emit(&format!("ldrb w2, [x0, #{}]", offset));
-                    self.emit(&format!("strb w2, [x1, #{}]", offset));
+                    self.emit(&format!("mov dl, [rax + {}]", offset));
+                    self.emit(&format!("mov [rdi + {}], dl", offset));
                 }
             } else {
                 let loop_lbl = self.new_label("struct_copy");
-                self.emit_load_imm("x2", size as i64);
+                self.emit_load_imm("rcx", size as i64);
+                self.emit("mov rsi, rax");
                 self.emit_label(&loop_lbl);
-                self.emit("ldrb w3, [x0], #1");
-                self.emit("strb w3, [x1], #1");
-                self.emit("subs x2, x2, #1");
-                self.emit(&format!("b.ne {}", loop_lbl));
+                self.emit("mov dl, [rsi]");
+                self.emit("mov [rdi], dl");
+                self.emit("inc rsi");
+                self.emit("inc rdi");
+                self.emit("dec rcx");
+                self.emit(&format!("jnz {}", loop_lbl));
             }
             return;
         }
         match ty.size() {
-            1 => self.emit("strb w0, [x1]"),
-            2 => self.emit("strh w0, [x1]"),
-            4 => self.emit("str w0, [x1]"),
-            8 => self.emit("str x0, [x1]"),
-            _ => self.emit("str x0, [x1]"),
+            1 => self.emit("mov byte ptr [rdi], al"),
+            2 => self.emit("mov word ptr [rdi], ax"),
+            4 => self.emit("mov dword ptr [rdi], eax"),
+            _ => self.emit("mov [rdi], rax"),
         }
     }
 
     fn emit_store_local(&mut self, reg: &str, offset: i32, size: usize) {
-        let r_name = reg.trim_start_matches('x');
-        if offset <= 256 {
-            match size {
-                1 => self.emit(&format!("strb w{}, [fp, #-{}]", r_name, offset)),
-                2 => self.emit(&format!("strh w{}, [fp, #-{}]", r_name, offset)),
-                4 => self.emit(&format!("str w{}, [fp, #-{}]", r_name, offset)),
-                _ => self.emit(&format!("str x{}, [fp, #-{}]", r_name, offset)),
-            }
-        } else {
-            self.emit_load_imm("x16", offset as i64);
-            self.emit("sub x16, fp, x16");
-            match size {
-                1 => self.emit(&format!("strb w{}, [x16]", r_name)),
-                2 => self.emit(&format!("strh w{}, [x16]", r_name)),
-                4 => self.emit(&format!("str w{}, [x16]", r_name)),
-                _ => self.emit(&format!("str x{}, [x16]", r_name)),
-            }
-        }
-    }
+        let (r8, r16, r32, r64) = match reg {
+            "rdi" => ("dil", "di", "edi", "rdi"),
+            "rsi" => ("sil", "si", "esi", "rsi"),
+            "rdx" => ("dl", "dx", "edx", "rdx"),
+            "rcx" => ("cl", "cx", "ecx", "rcx"),
+            "r8" => ("r8b", "r8w", "r8d", "r8"),
+            "r9" => ("r9b", "r9w", "r9d", "r9"),
+            "rax" => ("al", "ax", "eax", "rax"),
+            "r10" => ("r10b", "r10w", "r10d", "r10"),
+            "r11" => ("r11b", "r11w", "r11d", "r11"),
+            _ => (reg, reg, reg, reg),
+        };
 
-    fn emit_store_pair_local(&mut self, r1: &str, r2: &str, offset: i32) {
-        if (0..=504).contains(&offset) {
-            self.emit(&format!("stp {}, {}, [fp, #-{}]", r1, r2, offset));
-        } else {
-            self.emit_load_imm("x18", offset as i64);
-            self.emit("sub x18, fp, x18");
-            self.emit(&format!("stp {}, {}, [x18]", r1, r2));
+        match size {
+            1 => self.emit(&format!("mov byte ptr [rbp - {}], {}", offset, r8)),
+            2 => self.emit(&format!("mov word ptr [rbp - {}], {}", offset, r16)),
+            4 => self.emit(&format!("mov dword ptr [rbp - {}], {}", offset, r32)),
+            _ => self.emit(&format!("mov qword ptr [rbp - {}], {}", offset, r64)),
         }
     }
 
@@ -290,32 +267,42 @@ impl AArch64Emitter {
         if bw == 0 {
             return;
         }
-        // Load existing word
+        // Load existing word into rdx
         match ty.size() {
-            1 => self.emit("ldrb w2, [x1]"),
-            2 => self.emit("ldrh w2, [x1]"),
-            4 => self.emit("ldr w2, [x1]"),
-            8 => self.emit("ldr x2, [x1]"),
-            _ => self.emit("ldr x2, [x1]"),
+            1 => self.emit("movzx edx, byte ptr [rdi]"),
+            2 => self.emit("movzx edx, word ptr [rdi]"),
+            4 => self.emit("mov edx, dword ptr [rdi]"),
+            _ => self.emit("mov rdx, [rdi]"),
         }
-        // Insert bw bits from x0 into x2 starting at boff
-        if ty.size() == 8 {
-            self.emit(&format!("bfi x2, x0, #{}, #{}", boff, bw));
-            self.emit("str x2, [x1]");
-        } else {
-            self.emit(&format!("bfi w2, w0, #{}, #{}", boff, bw));
-            match ty.size() {
-                1 => self.emit("strb w2, [x1]"),
-                2 => self.emit("strh w2, [x1]"),
-                4 => self.emit("str w2, [x1]"),
-                _ => self.emit("str w2, [x1]"),
-            }
+
+        let mask = (((1u128 << bw) - 1) << boff) as u64;
+        let val_mask = ((1u128 << bw) - 1) as u64;
+
+        self.emit(&format!("movabs rcx, {:#x}", !mask));
+        self.emit("and rdx, rcx");
+        self.emit(&format!("movabs rcx, {:#x}", val_mask));
+        self.emit("and rax, rcx");
+        if boff > 0 {
+            self.emit(&format!("shl rax, {}", boff));
         }
-        // Result of assignment in x0: extract/mask bitfield value
-        if ty.is_signed_integer() {
-            self.emit(&format!("sbfx x0, x0, #0, #{}", bw));
-        } else {
-            self.emit(&format!("ubfx x0, x0, #0, #{}", bw));
+        self.emit("or rdx, rax");
+
+        // Store back
+        match ty.size() {
+            1 => self.emit("mov byte ptr [rdi], dl"),
+            2 => self.emit("mov word ptr [rdi], dx"),
+            4 => self.emit("mov dword ptr [rdi], edx"),
+            _ => self.emit("mov [rdi], rdx"),
+        }
+
+        // Return bitfield value in rax
+        if boff > 0 {
+            self.emit(&format!("shr rax, {}", boff));
+        }
+        if ty.is_signed_integer() && bw < 64 {
+            let shift = 64 - bw;
+            self.emit(&format!("shl rax, {}", shift));
+            self.emit(&format!("sar rax, {}", shift));
         }
     }
 
@@ -335,38 +322,20 @@ impl AArch64Emitter {
     fn gen_expr_inner(&mut self, expr: &TypedExpr) {
         match &expr.kind {
             TypedExprKind::Int(v) => {
-                if *v >= 0 && *v <= 65535 {
-                    self.emit(&format!("mov x0, #{}", v));
-                } else if *v < 0 && *v >= -65536 {
-                    self.emit(&format!("movn x0, #{}", (!v) & 0xffff));
-                } else {
-                    self.emit_load_imm("x0", *v);
-                }
+                self.emit_load_imm("rax", *v);
             }
             TypedExprKind::Float(v) => {
-                self.emit_load_imm("x0", v.to_bits() as i64);
+                self.emit_load_imm("rax", v.to_bits() as i64);
             }
             TypedExprKind::Char(c) => {
-                self.emit(&format!("mov x0, #{}", *c as u32));
+                self.emit(&format!("mov eax, {}", *c as u32));
             }
             TypedExprKind::StringLiteral(label) => {
-                if self.is_macos {
-                    self.emit(&format!("adrp x0, {}@PAGE", label));
-                    self.emit(&format!("add x0, x0, {}@PAGEOFF", label));
-                } else {
-                    self.emit(&format!("adrp x0, {}", label));
-                    self.emit(&format!("add x0, x0, :lo12:{}", label));
-                }
+                self.emit(&format!("lea rax, [rip + {}]", label));
             }
             TypedExprKind::AddrOfLabel(lbl) => {
                 let sym = format!(".L.user.{}", lbl);
-                if self.is_macos {
-                    self.emit(&format!("adrp x0, {}@PAGE", sym));
-                    self.emit(&format!("add x0, x0, {}@PAGEOFF", sym));
-                } else {
-                    self.emit(&format!("adrp x0, {}", sym));
-                    self.emit(&format!("add x0, x0, :lo12:{}", sym));
-                }
+                self.emit(&format!("lea rax, [rip + {}]", sym));
             }
             TypedExprKind::LocalVar(_) | TypedExprKind::GlobalVar(_) | TypedExprKind::Deref(_) => {
                 self.gen_lval(expr);
@@ -382,10 +351,16 @@ impl AArch64Emitter {
                 if let (Some(bw), Some(boff)) = (*bit_width, *bit_offset)
                     && bw > 0
                 {
-                    if expr.ty.is_signed_integer() {
-                        self.emit(&format!("sbfx x0, x0, #{}, #{}", boff, bw));
-                    } else {
-                        self.emit(&format!("ubfx x0, x0, #{}, #{}", boff, bw));
+                    if boff > 0 {
+                        self.emit(&format!("shr rax, {}", boff));
+                    }
+                    let val_mask = ((1u128 << bw) - 1) as u64;
+                    self.emit(&format!("movabs rcx, {:#x}", val_mask));
+                    self.emit("and rax, rcx");
+                    if expr.ty.is_signed_integer() && bw < 64 {
+                        let shift = 64 - bw;
+                        self.emit(&format!("shl rax, {}", shift));
+                        self.emit(&format!("sar rax, {}", shift));
                     }
                 }
             }
@@ -396,180 +371,189 @@ impl AArch64Emitter {
                 self.gen_expr(inner);
                 if matches!(expr.ty.kind, TypeKind::Bool) {
                     if matches!(inner.ty.kind, TypeKind::Double) {
-                        self.emit("fmov d0, x0");
-                        self.emit("fcmp d0, #0.0");
-                        self.emit("cset x0, ne");
+                        self.emit("movq xmm0, rax");
+                        self.emit("xorpd xmm1, xmm1");
+                        self.emit("ucomisd xmm0, xmm1");
+                        self.emit("setne al");
+                        self.emit("setp cl");
+                        self.emit("or al, cl");
+                        self.emit("movzx eax, al");
                     } else if matches!(inner.ty.kind, TypeKind::Float) {
-                        self.emit("fmov s0, w0");
-                        self.emit("fcmp s0, #0.0");
-                        self.emit("cset x0, ne");
+                        self.emit("movd xmm0, eax");
+                        self.emit("xorps xmm1, xmm1");
+                        self.emit("ucomiss xmm0, xmm1");
+                        self.emit("setne al");
+                        self.emit("setp cl");
+                        self.emit("or al, cl");
+                        self.emit("movzx eax, al");
                     } else {
-                        self.emit("cmp x0, #0");
-                        self.emit("cset x0, ne");
+                        self.emit("test rax, rax");
+                        self.emit("setne al");
+                        self.emit("movzx eax, al");
                     }
                 } else if matches!(expr.ty.kind, TypeKind::Double) {
                     if matches!(inner.ty.kind, TypeKind::Double) {
                         // no-op
                     } else if matches!(inner.ty.kind, TypeKind::Float) {
-                        self.emit("fmov s0, w0");
-                        self.emit("fcvt d0, s0");
-                        self.emit("fmov x0, d0");
+                        self.emit("movd xmm0, eax");
+                        self.emit("cvtss2sd xmm0, xmm0");
+                        self.emit("movq rax, xmm0");
                     } else if inner.ty.is_integer() {
                         if inner.ty.size() == 8 {
                             if inner.ty.is_signed_integer() {
-                                self.emit("scvtf d0, x0");
+                                self.emit("cvtsi2sd xmm0, rax");
                             } else {
-                                self.emit("ucvtf d0, x0");
+                                let lbl_neg = self.new_label("u2d_neg");
+                                let lbl_end = self.new_label("u2d_end");
+                                self.emit("test rax, rax");
+                                self.emit(&format!("js {}", lbl_neg));
+                                self.emit("cvtsi2sd xmm0, rax");
+                                self.emit(&format!("jmp {}", lbl_end));
+                                self.emit_label(&lbl_neg);
+                                self.emit("mov rdx, rax");
+                                self.emit("shr rdx, 1");
+                                self.emit("and rax, 1");
+                                self.emit("or rdx, rax");
+                                self.emit("cvtsi2sd xmm0, rdx");
+                                self.emit("addsd xmm0, xmm0");
+                                self.emit_label(&lbl_end);
                             }
                         } else if inner.ty.is_signed_integer() {
-                            self.emit("scvtf d0, w0");
+                            self.emit("movsxd rax, eax");
+                            self.emit("cvtsi2sd xmm0, rax");
                         } else {
-                            self.emit("ucvtf d0, w0");
+                            self.emit("mov eax, eax");
+                            self.emit("cvtsi2sd xmm0, rax");
                         }
-                        self.emit("fmov x0, d0");
+                        self.emit("movq rax, xmm0");
                     }
                 } else if matches!(expr.ty.kind, TypeKind::Float) {
                     if matches!(inner.ty.kind, TypeKind::Double) {
-                        self.emit("fmov d0, x0");
-                        self.emit("fcvt s0, d0");
-                        self.emit("fmov w0, s0");
+                        self.emit("movq xmm0, rax");
+                        self.emit("cvtsd2ss xmm0, xmm0");
+                        self.emit("movd eax, xmm0");
                     } else if matches!(inner.ty.kind, TypeKind::Float) {
                         // no-op
                     } else if inner.ty.is_integer() {
                         if inner.ty.size() == 8 {
                             if inner.ty.is_signed_integer() {
-                                self.emit("scvtf s0, x0");
+                                self.emit("cvtsi2ss xmm0, rax");
                             } else {
-                                self.emit("ucvtf s0, x0");
+                                let lbl_neg = self.new_label("u2f_neg");
+                                let lbl_end = self.new_label("u2f_end");
+                                self.emit("test rax, rax");
+                                self.emit(&format!("js {}", lbl_neg));
+                                self.emit("cvtsi2ss xmm0, rax");
+                                self.emit(&format!("jmp {}", lbl_end));
+                                self.emit_label(&lbl_neg);
+                                self.emit("mov rdx, rax");
+                                self.emit("shr rdx, 1");
+                                self.emit("and rax, 1");
+                                self.emit("or rdx, rax");
+                                self.emit("cvtsi2ss xmm0, rdx");
+                                self.emit("addss xmm0, xmm0");
+                                self.emit_label(&lbl_end);
                             }
                         } else if inner.ty.is_signed_integer() {
-                            self.emit("scvtf s0, w0");
+                            self.emit("movsxd rax, eax");
+                            self.emit("cvtsi2ss xmm0, rax");
                         } else {
-                            self.emit("ucvtf s0, w0");
+                            self.emit("mov eax, eax");
+                            self.emit("cvtsi2ss xmm0, rax");
                         }
-                        self.emit("fmov w0, s0");
+                        self.emit("movd eax, xmm0");
                     }
                 } else if matches!(inner.ty.kind, TypeKind::Double) {
-                    // Casting from Double to Integer
-                    self.emit("fmov d0, x0");
+                    self.emit("movq xmm0, rax");
+                    self.emit("cvttsd2si rax, xmm0");
                     match expr.ty.size() {
-                        8 => {
+                        1 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("fcvtzs x0, d0");
+                                self.emit("movsx rax, al");
                             } else {
-                                self.emit("fcvtzu x0, d0");
-                            }
-                        }
-                        4 => {
-                            if expr.ty.is_signed_integer() {
-                                self.emit("fcvtzs w0, d0");
-                                self.emit("sxtw x0, w0");
-                            } else {
-                                self.emit("fcvtzu w0, d0");
-                                self.emit("uxtw x0, w0");
+                                self.emit("movzx eax, al");
                             }
                         }
                         2 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("fcvtzs w0, d0");
-                                self.emit("sxth x0, w0");
+                                self.emit("movsx rax, ax");
                             } else {
-                                self.emit("fcvtzu w0, d0");
-                                self.emit("uxth w0, w0");
+                                self.emit("movzx eax, ax");
                             }
                         }
-                        1 => {
+                        4 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("fcvtzs w0, d0");
-                                self.emit("sxtb x0, w0");
+                                self.emit("movsxd rax, eax");
                             } else {
-                                self.emit("fcvtzu w0, d0");
-                                self.emit("uxtb w0, w0");
+                                self.emit("mov eax, eax");
                             }
                         }
-                        _ => {
-                            self.emit("fcvtzs x0, d0");
-                        }
+                        _ => {}
                     }
                 } else if matches!(inner.ty.kind, TypeKind::Float) {
-                    // Casting from Float to Integer
-                    self.emit("fmov s0, w0");
+                    self.emit("movd xmm0, eax");
+                    self.emit("cvttss2si rax, xmm0");
                     match expr.ty.size() {
-                        8 => {
+                        1 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("fcvtzs x0, s0");
+                                self.emit("movsx rax, al");
                             } else {
-                                self.emit("fcvtzu x0, s0");
-                            }
-                        }
-                        4 => {
-                            if expr.ty.is_signed_integer() {
-                                self.emit("fcvtzs w0, s0");
-                                self.emit("sxtw x0, w0");
-                            } else {
-                                self.emit("fcvtzu w0, s0");
-                                self.emit("uxtw x0, w0");
+                                self.emit("movzx eax, al");
                             }
                         }
                         2 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("fcvtzs w0, s0");
-                                self.emit("sxth x0, w0");
+                                self.emit("movsx rax, ax");
                             } else {
-                                self.emit("fcvtzu w0, s0");
-                                self.emit("uxth w0, w0");
+                                self.emit("movzx eax, ax");
                             }
                         }
-                        1 => {
+                        4 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("fcvtzs w0, s0");
-                                self.emit("sxtb x0, w0");
+                                self.emit("movsxd rax, eax");
                             } else {
-                                self.emit("fcvtzu w0, s0");
-                                self.emit("uxtb w0, w0");
+                                self.emit("mov eax, eax");
                             }
                         }
-                        _ => {
-                            self.emit("fcvtzs x0, s0");
-                        }
+                        _ => {}
                     }
                 } else {
                     // Integer to Integer cast
                     match expr.ty.size() {
                         1 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("sxtb x0, w0");
+                                self.emit("movsx rax, al");
                             } else {
-                                self.emit("uxtb w0, w0");
+                                self.emit("movzx eax, al");
                             }
                         }
                         2 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("sxth x0, w0");
+                                self.emit("movsx rax, ax");
                             } else {
-                                self.emit("uxth w0, w0");
+                                self.emit("movzx eax, ax");
                             }
                         }
                         4 => {
                             if expr.ty.is_signed_integer() {
-                                self.emit("sxtw x0, w0");
+                                self.emit("movsxd rax, eax");
                             } else {
-                                self.emit("uxtw x0, w0");
+                                self.emit("mov eax, eax");
                             }
                         }
                         8 if inner.ty.is_integer() && inner.ty.size() < 8 => {
                             if inner.ty.is_signed_integer() {
                                 match inner.ty.size() {
-                                    1 => self.emit("sxtb x0, w0"),
-                                    2 => self.emit("sxth x0, w0"),
-                                    4 => self.emit("sxtw x0, w0"),
+                                    1 => self.emit("movsx rax, al"),
+                                    2 => self.emit("movsx rax, ax"),
+                                    4 => self.emit("movsxd rax, eax"),
                                     _ => {}
                                 }
                             } else {
                                 match inner.ty.size() {
-                                    1 => self.emit("uxtb w0, w0"),
-                                    2 => self.emit("uxth w0, w0"),
-                                    4 => self.emit("uxtw x0, w0"),
+                                    1 => self.emit("movzx eax, al"),
+                                    2 => self.emit("movzx eax, ax"),
+                                    4 => self.emit("mov eax, eax"),
                                     _ => {}
                                 }
                             }
@@ -583,10 +567,8 @@ impl AArch64Emitter {
                     self.gen_expr(rhs);
                     self.push();
                     self.gen_lval(lhs);
-                    self.pop("x1");
-                    self.emit("mov x2, x0");
-                    self.emit("mov x0, x1");
-                    self.emit("mov x1, x2");
+                    self.pop("rdi");
+                    self.emit("xchg rax, rdi"); // rax = value, rdi = address
                     if let TypedExprKind::Member {
                         bit_width: Some(bw),
                         bit_offset: Some(boff),
@@ -609,96 +591,116 @@ impl AArch64Emitter {
                 | BinaryOp::ShlAssign
                 | BinaryOp::ShrAssign => {
                     self.gen_lval(lhs);
-                    self.push();
+                    self.push(); // [dest_addr]
                     self.gen_expr(lhs);
-                    self.push();
-                    self.gen_expr(rhs);
-                    self.pop("x1");
+                    self.push(); // [dest_addr, lhs_val]
+                    self.gen_expr(rhs); // rax = rhs_val
+                    self.pop("rdi"); // rdi = lhs_val, rax = rhs_val
                     match op {
                         BinaryOp::PlusAssign => {
                             if matches!(lhs.ty.kind, TypeKind::Double) {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fadd d0, d1, d0");
-                                self.emit("fmov x0, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("addsd xmm0, xmm1");
+                                self.emit("movq rax, xmm0");
                             } else if matches!(lhs.ty.kind, TypeKind::Float) {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fadd s0, s1, s0");
-                                self.emit("fmov w0, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("addss xmm0, xmm1");
+                                self.emit("movd eax, xmm0");
                             } else {
-                                self.emit("add x0, x1, x0");
+                                self.emit("add rax, rdi");
                             }
                         }
                         BinaryOp::MinusAssign => {
                             if matches!(lhs.ty.kind, TypeKind::Double) {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fsub d0, d1, d0");
-                                self.emit("fmov x0, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("subsd xmm1, xmm0");
+                                self.emit("movq rax, xmm1");
                             } else if matches!(lhs.ty.kind, TypeKind::Float) {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fsub s0, s1, s0");
-                                self.emit("fmov w0, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("subss xmm1, xmm0");
+                                self.emit("movd eax, xmm1");
                             } else {
-                                self.emit("sub x0, x1, x0");
+                                self.emit("sub rdi, rax");
+                                self.emit("mov rax, rdi");
                             }
                         }
                         BinaryOp::StarAssign => {
                             if matches!(lhs.ty.kind, TypeKind::Double) {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fmul d0, d1, d0");
-                                self.emit("fmov x0, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("mulsd xmm0, xmm1");
+                                self.emit("movq rax, xmm0");
                             } else if matches!(lhs.ty.kind, TypeKind::Float) {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fmul s0, s1, s0");
-                                self.emit("fmov w0, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("mulss xmm0, xmm1");
+                                self.emit("movd eax, xmm0");
                             } else {
-                                self.emit("mul x0, x1, x0");
+                                self.emit("imul rax, rdi");
                             }
                         }
                         BinaryOp::SlashAssign => {
                             if matches!(lhs.ty.kind, TypeKind::Double) {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fdiv d0, d1, d0");
-                                self.emit("fmov x0, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("divsd xmm1, xmm0");
+                                self.emit("movq rax, xmm1");
                             } else if matches!(lhs.ty.kind, TypeKind::Float) {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fdiv s0, s1, s0");
-                                self.emit("fmov w0, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("divss xmm1, xmm0");
+                                self.emit("movd eax, xmm1");
                             } else if lhs.ty.is_signed_integer() {
-                                self.emit("sdiv x0, x1, x0");
+                                self.emit("mov rcx, rax");
+                                self.emit("mov rax, rdi");
+                                self.emit("cqo");
+                                self.emit("idiv rcx");
                             } else {
-                                self.emit("udiv x0, x1, x0");
+                                self.emit("mov rcx, rax");
+                                self.emit("mov rax, rdi");
+                                self.emit("xor edx, edx");
+                                self.emit("div rcx");
                             }
                         }
                         BinaryOp::PercentAssign => {
                             if lhs.ty.is_signed_integer() {
-                                self.emit("sdiv x2, x1, x0");
+                                self.emit("mov rcx, rax");
+                                self.emit("mov rax, rdi");
+                                self.emit("cqo");
+                                self.emit("idiv rcx");
+                                self.emit("mov rax, rdx");
                             } else {
-                                self.emit("udiv x2, x1, x0");
+                                self.emit("mov rcx, rax");
+                                self.emit("mov rax, rdi");
+                                self.emit("xor edx, edx");
+                                self.emit("div rcx");
+                                self.emit("mov rax, rdx");
                             }
-                            self.emit("msub x0, x2, x0, x1");
                         }
-                        BinaryOp::AmpAssign => self.emit("and x0, x1, x0"),
-                        BinaryOp::PipeAssign => self.emit("orr x0, x1, x0"),
-                        BinaryOp::CaretAssign => self.emit("eor x0, x1, x0"),
-                        BinaryOp::ShlAssign => self.emit("lsl x0, x1, x0"),
+                        BinaryOp::AmpAssign => self.emit("and rax, rdi"),
+                        BinaryOp::PipeAssign => self.emit("or rax, rdi"),
+                        BinaryOp::CaretAssign => self.emit("xor rax, rdi"),
+                        BinaryOp::ShlAssign => {
+                            self.emit("mov rcx, rax");
+                            self.emit("mov rax, rdi");
+                            self.emit("shl rax, cl");
+                        }
                         BinaryOp::ShrAssign => {
+                            self.emit("mov rcx, rax");
+                            self.emit("mov rax, rdi");
                             if lhs.ty.is_signed_integer() {
-                                self.emit("asr x0, x1, x0");
+                                self.emit("sar rax, cl");
                             } else {
-                                self.emit("lsr x0, x1, x0");
+                                self.emit("shr rax, cl");
                             }
                         }
                         _ => unreachable!(),
                     }
-                    self.pop("x1");
+                    self.pop("rdi"); // rdi = dest_addr, rax = result_val
                     if let TypedExprKind::Member {
                         bit_width: Some(bw),
                         bit_offset: Some(boff),
@@ -715,18 +717,18 @@ impl AArch64Emitter {
                     let end_label = self.new_label("land_end");
 
                     self.gen_expr(lhs);
-                    self.emit("cmp x0, #0");
-                    self.emit(&format!("b.eq {}", false_label));
+                    self.emit("test rax, rax");
+                    self.emit(&format!("jz {}", false_label));
 
                     self.gen_expr(rhs);
-                    self.emit("cmp x0, #0");
-                    self.emit(&format!("b.eq {}", false_label));
+                    self.emit("test rax, rax");
+                    self.emit(&format!("jz {}", false_label));
 
-                    self.emit("mov x0, #1");
-                    self.emit(&format!("b {}", end_label));
+                    self.emit("mov eax, 1");
+                    self.emit(&format!("jmp {}", end_label));
 
                     self.emit_label(&false_label);
-                    self.emit("mov x0, #0");
+                    self.emit("xor eax, eax");
 
                     self.emit_label(&end_label);
                 }
@@ -735,18 +737,18 @@ impl AArch64Emitter {
                     let end_label = self.new_label("lor_end");
 
                     self.gen_expr(lhs);
-                    self.emit("cmp x0, #0");
-                    self.emit(&format!("b.ne {}", true_label));
+                    self.emit("test rax, rax");
+                    self.emit(&format!("jnz {}", true_label));
 
                     self.gen_expr(rhs);
-                    self.emit("cmp x0, #0");
-                    self.emit(&format!("b.ne {}", true_label));
+                    self.emit("test rax, rax");
+                    self.emit(&format!("jnz {}", true_label));
 
-                    self.emit("mov x0, #0");
-                    self.emit(&format!("b {}", end_label));
+                    self.emit("xor eax, eax");
+                    self.emit(&format!("jmp {}", end_label));
 
                     self.emit_label(&true_label);
-                    self.emit("mov x0, #1");
+                    self.emit("mov eax, 1");
 
                     self.emit_label(&end_label);
                 }
@@ -758,91 +760,102 @@ impl AArch64Emitter {
                     self.gen_expr(lhs);
                     self.push();
                     self.gen_expr(rhs);
-                    self.pop("x1");
+                    self.pop("rdi"); // rdi = lhs, rax = rhs
 
                     match op {
                         BinaryOp::Add => {
                             if matches!(expr.ty.kind, TypeKind::Double) {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fadd d0, d1, d0");
-                                self.emit("fmov x0, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("addsd xmm0, xmm1");
+                                self.emit("movq rax, xmm0");
                             } else if matches!(expr.ty.kind, TypeKind::Float) {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fadd s0, s1, s0");
-                                self.emit("fmov w0, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("addss xmm0, xmm1");
+                                self.emit("movd eax, xmm0");
                             } else {
-                                self.emit("add x0, x1, x0");
+                                self.emit("add rax, rdi");
                             }
                         }
                         BinaryOp::Sub => {
                             if matches!(expr.ty.kind, TypeKind::Double) {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fsub d0, d1, d0");
-                                self.emit("fmov x0, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("subsd xmm1, xmm0");
+                                self.emit("movq rax, xmm1");
                             } else if matches!(expr.ty.kind, TypeKind::Float) {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fsub s0, s1, s0");
-                                self.emit("fmov w0, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("subss xmm1, xmm0");
+                                self.emit("movd eax, xmm1");
                             } else {
-                                self.emit("sub x0, x1, x0");
+                                self.emit("sub rdi, rax");
+                                self.emit("mov rax, rdi");
                             }
                         }
                         BinaryOp::Mul => {
                             if matches!(expr.ty.kind, TypeKind::Double) {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fmul d0, d1, d0");
-                                self.emit("fmov x0, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("mulsd xmm0, xmm1");
+                                self.emit("movq rax, xmm0");
                             } else if matches!(expr.ty.kind, TypeKind::Float) {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fmul s0, s1, s0");
-                                self.emit("fmov w0, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("mulss xmm0, xmm1");
+                                self.emit("movd eax, xmm0");
                             } else {
                                 let is_32bit = expr.ty.size() <= 4 && !expr.ty.is_pointer();
                                 if is_32bit {
-                                    self.emit("mul w0, w1, w0");
+                                    self.emit("imul eax, edi");
                                     if expr.ty.is_signed_integer() {
-                                        self.emit("sxtw x0, w0");
+                                        self.emit("movsxd rax, eax");
                                     } else {
-                                        self.emit("uxtw x0, w0");
+                                        self.emit("mov eax, eax");
                                     }
                                 } else {
-                                    self.emit("mul x0, x1, x0");
+                                    self.emit("imul rax, rdi");
                                 }
                             }
                         }
                         BinaryOp::Div => {
                             if matches!(expr.ty.kind, TypeKind::Double) {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fdiv d0, d1, d0");
-                                self.emit("fmov x0, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("divsd xmm1, xmm0");
+                                self.emit("movq rax, xmm1");
                             } else if matches!(expr.ty.kind, TypeKind::Float) {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fdiv s0, s1, s0");
-                                self.emit("fmov w0, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("divss xmm1, xmm0");
+                                self.emit("movd eax, xmm1");
                             } else {
                                 let is_32bit = expr.ty.size() <= 4 && !expr.ty.is_pointer();
                                 if is_32bit {
                                     if expr.ty.is_signed_integer() {
-                                        self.emit("sdiv w0, w1, w0");
-                                        self.emit("sxtw x0, w0");
+                                        self.emit("mov ecx, eax");
+                                        self.emit("mov eax, edi");
+                                        self.emit("cdq");
+                                        self.emit("idiv ecx");
+                                        self.emit("movsxd rax, eax");
                                     } else {
-                                        self.emit("udiv w0, w1, w0");
-                                        self.emit("uxtw x0, w0");
+                                        self.emit("mov ecx, eax");
+                                        self.emit("mov eax, edi");
+                                        self.emit("xor edx, edx");
+                                        self.emit("div ecx");
+                                        self.emit("mov eax, eax");
                                     }
+                                } else if expr.ty.is_signed_integer() {
+                                    self.emit("mov rcx, rax");
+                                    self.emit("mov rax, rdi");
+                                    self.emit("cqo");
+                                    self.emit("idiv rcx");
                                 } else {
-                                    if expr.ty.is_signed_integer() {
-                                        self.emit("sdiv x0, x1, x0");
-                                    } else {
-                                        self.emit("udiv x0, x1, x0");
-                                    }
+                                    self.emit("mov rcx, rax");
+                                    self.emit("mov rax, rdi");
+                                    self.emit("xor edx, edx");
+                                    self.emit("div rcx");
                                 }
                             }
                         }
@@ -850,149 +863,173 @@ impl AArch64Emitter {
                             let is_32bit = expr.ty.size() <= 4 && !expr.ty.is_pointer();
                             if is_32bit {
                                 if expr.ty.is_signed_integer() {
-                                    self.emit("sdiv w2, w1, w0");
-                                    self.emit("msub w0, w2, w0, w1");
-                                    self.emit("sxtw x0, w0");
+                                    self.emit("mov ecx, eax");
+                                    self.emit("mov eax, edi");
+                                    self.emit("cdq");
+                                    self.emit("idiv ecx");
+                                    self.emit("movsxd rax, edx");
                                 } else {
-                                    self.emit("udiv w2, w1, w0");
-                                    self.emit("msub w0, w2, w0, w1");
-                                    self.emit("uxtw x0, w0");
+                                    self.emit("mov ecx, eax");
+                                    self.emit("mov eax, edi");
+                                    self.emit("xor edx, edx");
+                                    self.emit("div ecx");
+                                    self.emit("mov eax, edx");
                                 }
+                            } else if expr.ty.is_signed_integer() {
+                                self.emit("mov rcx, rax");
+                                self.emit("mov rax, rdi");
+                                self.emit("cqo");
+                                self.emit("idiv rcx");
+                                self.emit("mov rax, rdx");
                             } else {
-                                if expr.ty.is_signed_integer() {
-                                    self.emit("sdiv x2, x1, x0");
-                                    self.emit("msub x0, x2, x0, x1");
-                                } else {
-                                    self.emit("udiv x2, x1, x0");
-                                    self.emit("msub x0, x2, x0, x1");
-                                }
+                                self.emit("mov rcx, rax");
+                                self.emit("mov rax, rdi");
+                                self.emit("xor edx, edx");
+                                self.emit("div rcx");
+                                self.emit("mov rax, rdx");
                             }
                         }
                         BinaryOp::BitAnd => {
                             let is_32bit = expr.ty.size() <= 4 && !expr.ty.is_pointer();
                             if is_32bit {
-                                self.emit("and w0, w1, w0");
-                                self.emit("uxtw x0, w0");
+                                self.emit("and eax, edi");
+                                self.emit("mov eax, eax");
                             } else {
-                                self.emit("and x0, x1, x0");
+                                self.emit("and rax, rdi");
                             }
                         }
                         BinaryOp::BitOr => {
                             let is_32bit = expr.ty.size() <= 4 && !expr.ty.is_pointer();
                             if is_32bit {
-                                self.emit("orr w0, w1, w0");
-                                self.emit("uxtw x0, w0");
+                                self.emit("or eax, edi");
+                                self.emit("mov eax, eax");
                             } else {
-                                self.emit("orr x0, x1, x0");
+                                self.emit("or rax, rdi");
                             }
                         }
                         BinaryOp::BitXor => {
                             let is_32bit = expr.ty.size() <= 4 && !expr.ty.is_pointer();
                             if is_32bit {
-                                self.emit("eor w0, w1, w0");
-                                self.emit("uxtw x0, w0");
+                                self.emit("xor eax, edi");
+                                self.emit("mov eax, eax");
                             } else {
-                                self.emit("eor x0, x1, x0");
+                                self.emit("xor rax, rdi");
                             }
                         }
                         BinaryOp::Shl => {
                             let is_32bit = expr.ty.size() <= 4 && !expr.ty.is_pointer();
+                            self.emit("mov rcx, rax");
+                            self.emit("mov rax, rdi");
                             if is_32bit {
-                                self.emit("lsl w0, w1, w0");
+                                self.emit("shl eax, cl");
                                 if expr.ty.is_signed_integer() {
-                                    self.emit("sxtw x0, w0");
+                                    self.emit("movsxd rax, eax");
                                 } else {
-                                    self.emit("uxtw x0, w0");
+                                    self.emit("mov eax, eax");
                                 }
                             } else {
-                                self.emit("lsl x0, x1, x0");
+                                self.emit("shl rax, cl");
                             }
                         }
                         BinaryOp::Shr => {
                             let is_32bit = expr.ty.size() <= 4 && !expr.ty.is_pointer();
+                            self.emit("mov rcx, rax");
+                            self.emit("mov rax, rdi");
                             if is_32bit {
                                 if expr.ty.is_signed_integer() {
-                                    self.emit("asr w0, w1, w0");
-                                    self.emit("sxtw x0, w0");
+                                    self.emit("sar eax, cl");
+                                    self.emit("movsxd rax, eax");
                                 } else {
-                                    self.emit("lsr w0, w1, w0");
-                                    self.emit("uxtw x0, w0");
+                                    self.emit("shr eax, cl");
+                                    self.emit("mov eax, eax");
                                 }
+                            } else if expr.ty.is_signed_integer() {
+                                self.emit("sar rax, cl");
                             } else {
-                                if expr.ty.is_signed_integer() {
-                                    self.emit("asr x0, x1, x0");
-                                } else {
-                                    self.emit("lsr x0, x1, x0");
-                                }
+                                self.emit("shr rax, cl");
                             }
                         }
                         BinaryOp::Eq => {
                             if matches!(lhs.ty.kind, TypeKind::Double)
                                 || matches!(rhs.ty.kind, TypeKind::Double)
                             {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fcmp d1, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("ucomisd xmm1, xmm0");
+                                self.emit("sete al");
+                                self.emit("setnp cl");
+                                self.emit("and al, cl");
                             } else if matches!(lhs.ty.kind, TypeKind::Float)
                                 || matches!(rhs.ty.kind, TypeKind::Float)
                             {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fcmp s1, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("ucomiss xmm1, xmm0");
+                                self.emit("sete al");
+                                self.emit("setnp cl");
+                                self.emit("and al, cl");
                             } else {
                                 let is_32bit = lhs.ty.size() <= 4
                                     && rhs.ty.size() <= 4
                                     && !lhs.ty.is_pointer()
                                     && !rhs.ty.is_pointer();
                                 if is_32bit {
-                                    self.emit("cmp w1, w0");
+                                    self.emit("cmp edi, eax");
                                 } else {
-                                    self.emit("cmp x1, x0");
+                                    self.emit("cmp rdi, rax");
                                 }
+                                self.emit("sete al");
                             }
-                            self.emit("cset x0, eq");
+                            self.emit("movzx eax, al");
                         }
                         BinaryOp::Ne => {
                             if matches!(lhs.ty.kind, TypeKind::Double)
                                 || matches!(rhs.ty.kind, TypeKind::Double)
                             {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fcmp d1, d0");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("ucomisd xmm1, xmm0");
+                                self.emit("setne al");
+                                self.emit("setp cl");
+                                self.emit("or al, cl");
                             } else if matches!(lhs.ty.kind, TypeKind::Float)
                                 || matches!(rhs.ty.kind, TypeKind::Float)
                             {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fcmp s1, s0");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("ucomiss xmm1, xmm0");
+                                self.emit("setne al");
+                                self.emit("setp cl");
+                                self.emit("or al, cl");
                             } else {
                                 let is_32bit = lhs.ty.size() <= 4
                                     && rhs.ty.size() <= 4
                                     && !lhs.ty.is_pointer()
                                     && !rhs.ty.is_pointer();
                                 if is_32bit {
-                                    self.emit("cmp w1, w0");
+                                    self.emit("cmp edi, eax");
                                 } else {
-                                    self.emit("cmp x1, x0");
+                                    self.emit("cmp rdi, rax");
                                 }
+                                self.emit("setne al");
                             }
-                            self.emit("cset x0, ne");
+                            self.emit("movzx eax, al");
                         }
                         BinaryOp::Lt => {
                             if matches!(lhs.ty.kind, TypeKind::Double)
                                 || matches!(rhs.ty.kind, TypeKind::Double)
                             {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fcmp d1, d0");
-                                self.emit("cset x0, mi");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("ucomisd xmm1, xmm0");
+                                self.emit("setb al");
                             } else if matches!(lhs.ty.kind, TypeKind::Float)
                                 || matches!(rhs.ty.kind, TypeKind::Float)
                             {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fcmp s1, s0");
-                                self.emit("cset x0, mi");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("ucomiss xmm1, xmm0");
+                                self.emit("setb al");
                             } else {
                                 let is_signed = lhs.ty.is_signed_integer()
                                     && rhs.ty.is_signed_integer()
@@ -1003,32 +1040,33 @@ impl AArch64Emitter {
                                     && !lhs.ty.is_pointer()
                                     && !rhs.ty.is_pointer();
                                 if is_32bit {
-                                    self.emit("cmp w1, w0");
+                                    self.emit("cmp edi, eax");
                                 } else {
-                                    self.emit("cmp x1, x0");
+                                    self.emit("cmp rdi, rax");
                                 }
                                 if is_signed {
-                                    self.emit("cset x0, lt");
+                                    self.emit("setl al");
                                 } else {
-                                    self.emit("cset x0, lo");
+                                    self.emit("setb al");
                                 }
                             }
+                            self.emit("movzx eax, al");
                         }
                         BinaryOp::Le => {
                             if matches!(lhs.ty.kind, TypeKind::Double)
                                 || matches!(rhs.ty.kind, TypeKind::Double)
                             {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fcmp d1, d0");
-                                self.emit("cset x0, ls");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("ucomisd xmm1, xmm0");
+                                self.emit("setbe al");
                             } else if matches!(lhs.ty.kind, TypeKind::Float)
                                 || matches!(rhs.ty.kind, TypeKind::Float)
                             {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fcmp s1, s0");
-                                self.emit("cset x0, ls");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("ucomiss xmm1, xmm0");
+                                self.emit("setbe al");
                             } else {
                                 let is_signed = lhs.ty.is_signed_integer()
                                     && rhs.ty.is_signed_integer()
@@ -1039,32 +1077,33 @@ impl AArch64Emitter {
                                     && !lhs.ty.is_pointer()
                                     && !rhs.ty.is_pointer();
                                 if is_32bit {
-                                    self.emit("cmp w1, w0");
+                                    self.emit("cmp edi, eax");
                                 } else {
-                                    self.emit("cmp x1, x0");
+                                    self.emit("cmp rdi, rax");
                                 }
                                 if is_signed {
-                                    self.emit("cset x0, le");
+                                    self.emit("setle al");
                                 } else {
-                                    self.emit("cset x0, ls");
+                                    self.emit("setbe al");
                                 }
                             }
+                            self.emit("movzx eax, al");
                         }
                         BinaryOp::Gt => {
                             if matches!(lhs.ty.kind, TypeKind::Double)
                                 || matches!(rhs.ty.kind, TypeKind::Double)
                             {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fcmp d1, d0");
-                                self.emit("cset x0, gt");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("ucomisd xmm1, xmm0");
+                                self.emit("seta al");
                             } else if matches!(lhs.ty.kind, TypeKind::Float)
                                 || matches!(rhs.ty.kind, TypeKind::Float)
                             {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fcmp s1, s0");
-                                self.emit("cset x0, gt");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("ucomiss xmm1, xmm0");
+                                self.emit("seta al");
                             } else {
                                 let is_signed = lhs.ty.is_signed_integer()
                                     && rhs.ty.is_signed_integer()
@@ -1075,32 +1114,33 @@ impl AArch64Emitter {
                                     && !lhs.ty.is_pointer()
                                     && !rhs.ty.is_pointer();
                                 if is_32bit {
-                                    self.emit("cmp w1, w0");
+                                    self.emit("cmp edi, eax");
                                 } else {
-                                    self.emit("cmp x1, x0");
+                                    self.emit("cmp rdi, rax");
                                 }
                                 if is_signed {
-                                    self.emit("cset x0, gt");
+                                    self.emit("setg al");
                                 } else {
-                                    self.emit("cset x0, hi");
+                                    self.emit("seta al");
                                 }
                             }
+                            self.emit("movzx eax, al");
                         }
                         BinaryOp::Ge => {
                             if matches!(lhs.ty.kind, TypeKind::Double)
                                 || matches!(rhs.ty.kind, TypeKind::Double)
                             {
-                                self.emit("fmov d0, x0");
-                                self.emit("fmov d1, x1");
-                                self.emit("fcmp d1, d0");
-                                self.emit("cset x0, ge");
+                                self.emit("movq xmm1, rdi");
+                                self.emit("movq xmm0, rax");
+                                self.emit("ucomisd xmm1, xmm0");
+                                self.emit("setae al");
                             } else if matches!(lhs.ty.kind, TypeKind::Float)
                                 || matches!(rhs.ty.kind, TypeKind::Float)
                             {
-                                self.emit("fmov s0, w0");
-                                self.emit("fmov s1, w1");
-                                self.emit("fcmp s1, s0");
-                                self.emit("cset x0, ge");
+                                self.emit("movd xmm1, edi");
+                                self.emit("movd xmm0, eax");
+                                self.emit("ucomiss xmm1, xmm0");
+                                self.emit("setae al");
                             } else {
                                 let is_signed = lhs.ty.is_signed_integer()
                                     && rhs.ty.is_signed_integer()
@@ -1111,16 +1151,17 @@ impl AArch64Emitter {
                                     && !lhs.ty.is_pointer()
                                     && !rhs.ty.is_pointer();
                                 if is_32bit {
-                                    self.emit("cmp w1, w0");
+                                    self.emit("cmp edi, eax");
                                 } else {
-                                    self.emit("cmp x1, x0");
+                                    self.emit("cmp rdi, rax");
                                 }
                                 if is_signed {
-                                    self.emit("cset x0, ge");
+                                    self.emit("setge al");
                                 } else {
-                                    self.emit("cset x0, hs");
+                                    self.emit("setae al");
                                 }
                             }
+                            self.emit("movzx eax, al");
                         }
                         _ => {}
                     }
@@ -1133,25 +1174,30 @@ impl AArch64Emitter {
                 UnaryOp::Neg => {
                     self.gen_expr(inner);
                     if matches!(inner.ty.kind, TypeKind::Double) {
-                        self.emit("fmov d0, x0");
-                        self.emit("fneg d0, d0");
-                        self.emit("fmov x0, d0");
+                        self.emit("movq xmm0, rax");
+                        self.emit("movabs rcx, -9223372036854775808"); // 0x8000000000000000
+                        self.emit("movq xmm1, rcx");
+                        self.emit("xorpd xmm0, xmm1");
+                        self.emit("movq rax, xmm0");
                     } else if matches!(inner.ty.kind, TypeKind::Float) {
-                        self.emit("fmov s0, w0");
-                        self.emit("fneg s0, s0");
-                        self.emit("fmov w0, s0");
+                        self.emit("movd xmm0, eax");
+                        self.emit("mov ecx, -2147483648"); // 0x80000000
+                        self.emit("movd xmm1, ecx");
+                        self.emit("xorps xmm0, xmm1");
+                        self.emit("movd eax, xmm0");
                     } else {
-                        self.emit("neg x0, x0");
+                        self.emit("neg rax");
                     }
                 }
                 UnaryOp::BitNot => {
                     self.gen_expr(inner);
-                    self.emit("mvn x0, x0");
+                    self.emit("not rax");
                 }
                 UnaryOp::LogNot => {
                     self.gen_expr(inner);
-                    self.emit("cmp x0, #0");
-                    self.emit("cset x0, eq");
+                    self.emit("test rax, rax");
+                    self.emit("sete al");
+                    self.emit("movzx eax, al");
                 }
                 UnaryOp::PreInc => {
                     let step = if inner.ty.is_pointer() {
@@ -1162,8 +1208,8 @@ impl AArch64Emitter {
                     self.gen_lval(inner);
                     self.push();
                     self.gen_expr(inner);
-                    self.emit(&format!("add x0, x0, #{}", step));
-                    self.pop("x1");
+                    self.emit(&format!("add rax, {}", step));
+                    self.pop("rdi"); // rdi = dest_addr, rax = val
                     if let TypedExprKind::Member {
                         bit_width: Some(bw),
                         bit_offset: Some(boff),
@@ -1184,8 +1230,8 @@ impl AArch64Emitter {
                     self.gen_lval(inner);
                     self.push();
                     self.gen_expr(inner);
-                    self.emit(&format!("sub x0, x0, #{}", step));
-                    self.pop("x1");
+                    self.emit(&format!("sub rax, {}", step));
+                    self.pop("rdi");
                     if let TypedExprKind::Member {
                         bit_width: Some(bw),
                         bit_offset: Some(boff),
@@ -1204,12 +1250,14 @@ impl AArch64Emitter {
                         1
                     };
                     self.gen_lval(inner);
-                    self.push();
+                    self.push(); // [addr]
                     self.gen_expr(inner);
-                    self.push();
-                    self.emit(&format!("add x0, x0, #{}", step));
-                    self.pop("x3"); // previous value
-                    self.pop("x1"); // address
+                    self.push(); // [addr, old_val]
+                    self.emit(&format!("add rax, {}", step)); // new_val in rax
+                    self.emit("mov rdx, rax"); // new_val in rdx
+                    self.pop("rcx"); // rcx = old_val
+                    self.pop("rdi"); // rdi = addr
+                    self.emit("mov rax, rdx"); // rax = new_val
                     if let TypedExprKind::Member {
                         bit_width: Some(bw),
                         bit_offset: Some(boff),
@@ -1220,7 +1268,7 @@ impl AArch64Emitter {
                     } else {
                         self.store(&inner.ty);
                     }
-                    self.emit("mov x0, x3");
+                    self.emit("mov rax, rcx"); // return old_val
                 }
                 UnaryOp::PostDec => {
                     let step = if inner.ty.is_pointer() {
@@ -1229,12 +1277,14 @@ impl AArch64Emitter {
                         1
                     };
                     self.gen_lval(inner);
-                    self.push();
+                    self.push(); // [addr]
                     self.gen_expr(inner);
-                    self.push();
-                    self.emit(&format!("sub x0, x0, #{}", step));
-                    self.pop("x3"); // previous value
-                    self.pop("x1"); // address
+                    self.push(); // [addr, old_val]
+                    self.emit(&format!("sub rax, {}", step)); // new_val in rax
+                    self.emit("mov rdx, rax"); // new_val in rdx
+                    self.pop("rcx"); // rcx = old_val
+                    self.pop("rdi"); // rdi = addr
+                    self.emit("mov rax, rdx"); // rax = new_val
                     if let TypedExprKind::Member {
                         bit_width: Some(bw),
                         bit_offset: Some(boff),
@@ -1245,15 +1295,13 @@ impl AArch64Emitter {
                     } else {
                         self.store(&inner.ty);
                     }
-                    self.emit("mov x0, x3");
+                    self.emit("mov rax, rcx"); // return old_val
                 }
                 UnaryOp::Deref
                 | UnaryOp::AddrOf
                 | UnaryOp::Sizeof
                 | UnaryOp::Alignof
-                | UnaryOp::AddrOfLabel => {
-                    // Handled in other paths
-                }
+                | UnaryOp::AddrOfLabel => {}
             },
             TypedExprKind::Ternary {
                 cond,
@@ -1264,11 +1312,11 @@ impl AArch64Emitter {
                 let end_label = self.new_label("ternary_end");
 
                 self.gen_expr(cond);
-                self.emit("cmp x0, #0");
-                self.emit(&format!("b.eq {}", else_label));
+                self.emit("test rax, rax");
+                self.emit(&format!("jz {}", else_label));
 
                 self.gen_expr(then_expr);
-                self.emit(&format!("b {}", end_label));
+                self.emit(&format!("jmp {}", end_label));
 
                 self.emit_label(&else_label);
                 self.gen_expr(else_expr);
@@ -1282,7 +1330,7 @@ impl AArch64Emitter {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             } else {
-                                self.emit("mov x0, #0");
+                                self.emit("xor eax, eax");
                             }
                             return;
                         }
@@ -1290,84 +1338,126 @@ impl AArch64Emitter {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             }
-                            self.emit("clz w0, w0");
-                            self.emit("uxtw x0, w0");
+                            let nz_lbl = self.new_label("clz_nz");
+                            let end_lbl = self.new_label("clz_end");
+                            self.emit("test eax, eax");
+                            self.emit(&format!("jnz {}", nz_lbl));
+                            self.emit("mov eax, 32");
+                            self.emit(&format!("jmp {}", end_lbl));
+                            self.emit_label(&nz_lbl);
+                            self.emit("bsr eax, eax");
+                            self.emit("xor eax, 31");
+                            self.emit_label(&end_lbl);
+                            self.emit("mov eax, eax");
                             return;
                         }
                         "__builtin_clzll" | "__builtin_clzl" => {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             }
-                            self.emit("clz x0, x0");
+                            let nz_lbl = self.new_label("clzll_nz");
+                            let end_lbl = self.new_label("clzll_end");
+                            self.emit("test rax, rax");
+                            self.emit(&format!("jnz {}", nz_lbl));
+                            self.emit("mov eax, 64");
+                            self.emit(&format!("jmp {}", end_lbl));
+                            self.emit_label(&nz_lbl);
+                            self.emit("bsr rax, rax");
+                            self.emit("xor rax, 63");
+                            self.emit_label(&end_lbl);
                             return;
                         }
                         "__builtin_ctz" => {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             }
-                            self.emit("rbit w0, w0");
-                            self.emit("clz w0, w0");
-                            self.emit("uxtw x0, w0");
+                            let nz_lbl = self.new_label("ctz_nz");
+                            let end_lbl = self.new_label("ctz_end");
+                            self.emit("test eax, eax");
+                            self.emit(&format!("jnz {}", nz_lbl));
+                            self.emit("mov eax, 32");
+                            self.emit(&format!("jmp {}", end_lbl));
+                            self.emit_label(&nz_lbl);
+                            self.emit("bsf eax, eax");
+                            self.emit_label(&end_lbl);
+                            self.emit("mov eax, eax");
                             return;
                         }
                         "__builtin_ctzll" | "__builtin_ctzl" => {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             }
-                            self.emit("rbit x0, x0");
-                            self.emit("clz x0, x0");
+                            let nz_lbl = self.new_label("ctzll_nz");
+                            let end_lbl = self.new_label("ctzll_end");
+                            self.emit("test rax, rax");
+                            self.emit(&format!("jnz {}", nz_lbl));
+                            self.emit("mov eax, 64");
+                            self.emit(&format!("jmp {}", end_lbl));
+                            self.emit_label(&nz_lbl);
+                            self.emit("bsf rax, rax");
+                            self.emit_label(&end_lbl);
                             return;
                         }
                         "__builtin_bswap16" => {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             }
-                            self.emit("rev16 w0, w0");
-                            self.emit("uxtw x0, w0");
+                            self.emit("rol ax, 8");
+                            self.emit("movzx eax, ax");
                             return;
                         }
                         "__builtin_bswap32" => {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             }
-                            self.emit("rev w0, w0");
-                            self.emit("uxtw x0, w0");
+                            self.emit("bswap eax");
+                            self.emit("mov eax, eax");
                             return;
                         }
                         "__builtin_bswap64" => {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             }
-                            self.emit("rev x0, x0");
+                            self.emit("bswap rax");
                             return;
                         }
                         "__builtin_unreachable" => {
-                            self.emit("brk #0");
+                            self.emit("ud2");
                             return;
                         }
                         "__builtin_constant_p" => {
-                            self.emit("mov x0, #0");
+                            self.emit("xor eax, eax");
                             return;
                         }
                         "__builtin_frame_address" => {
-                            self.emit("mov x0, fp");
+                            self.emit("mov rax, rbp");
                             return;
                         }
                         "__builtin_inff" | "__builtin_inf" | "__builtin_huge_val" => {
-                            self.emit_load_imm("x0", 0x7ff0000000000000_u64 as i64);
+                            self.emit_load_imm("rax", 0x7ff0000000000000_u64 as i64);
                             return;
                         }
                         "__builtin_nanf" | "__builtin_nan" => {
-                            self.emit_load_imm("x0", 0x7ff8000000000000_u64 as i64);
+                            self.emit_load_imm("rax", 0x7ff8000000000000_u64 as i64);
                             return;
                         }
                         "__builtin_va_start" => {
                             if !args.is_empty() {
-                                self.gen_lval(&args[0]);
-                                self.push();
-                                self.emit("add x0, fp, #16");
-                                self.pop("x1");
-                                self.emit("str x0, [x1]");
+                                self.gen_expr(&args[0]);
+                                let va_offset = self.current_func_va_offset;
+                                let named_count = self.current_func_named_count;
+                                let gp_offset = if named_count < 6 { named_count * 8 } else { 48 };
+                                let overflow_offset = if named_count > 6 {
+                                    16 + (named_count - 6) * 8
+                                } else {
+                                    16
+                                };
+                                self.emit(&format!("mov dword ptr [rax], {}", gp_offset));
+                                self.emit("mov dword ptr [rax + 4], 48");
+                                self.emit(&format!("lea rdx, [rbp + {}]", overflow_offset));
+                                self.emit("mov [rax + 8], rdx");
+                                self.emit(&format!("lea rdx, [rbp - {}]", va_offset));
+                                self.emit("mov [rax + 16], rdx");
                             }
                             return;
                         }
@@ -1378,30 +1468,15 @@ impl AArch64Emitter {
                             if !args.is_empty() {
                                 self.gen_expr(&args[0]);
                             }
-                            self.emit("add x0, x0, #15");
-                            self.emit("bic x0, x0, #15");
-                            self.emit("sub sp, sp, x0");
-                            self.emit("mov x0, sp");
+                            self.emit("add rax, 15");
+                            self.emit("and rax, -16");
+                            self.emit("sub rsp, rax");
+                            self.emit("mov rax, rsp");
                             return;
                         }
                         _ => {}
                     }
                 }
-
-                let is_variadic_on_macos = self.is_macos
-                    && match &callee.ty.kind {
-                        TypeKind::Function { is_variadic, .. } => *is_variadic,
-                        _ => false,
-                    };
-
-                let named_count = if is_variadic_on_macos {
-                    match &callee.ty.kind {
-                        TypeKind::Function { params, .. } => params.len(),
-                        _ => 0,
-                    }
-                } else {
-                    args.len()
-                };
 
                 enum ArgLocation {
                     Reg1,
@@ -1413,14 +1488,11 @@ impl AArch64Emitter {
                 let mut reg_idx = 0;
                 let mut stack_byte_offset = 0;
 
-                for (i, arg) in args.iter().enumerate() {
-                    if is_variadic_on_macos && i >= named_count {
-                        arg_locs.push(ArgLocation::Stack(stack_byte_offset, 8));
-                        stack_byte_offset += 8;
-                    } else if arg.ty.is_struct() || arg.ty.is_union() {
+                for arg in args {
+                    if arg.ty.is_struct() || arg.ty.is_union() {
                         let sz = arg.ty.size();
                         if sz <= 8 {
-                            if reg_idx < 8 {
+                            if reg_idx < 6 {
                                 arg_locs.push(ArgLocation::Reg1);
                                 reg_idx += 1;
                             } else {
@@ -1428,11 +1500,11 @@ impl AArch64Emitter {
                                 stack_byte_offset += 8;
                             }
                         } else if sz <= 16 {
-                            if reg_idx <= 6 {
+                            if reg_idx <= 4 {
                                 arg_locs.push(ArgLocation::Reg2);
                                 reg_idx += 2;
                             } else {
-                                reg_idx = 8;
+                                reg_idx = 6;
                                 arg_locs.push(ArgLocation::Stack(stack_byte_offset, 16));
                                 stack_byte_offset += 16;
                             }
@@ -1440,38 +1512,52 @@ impl AArch64Emitter {
                             arg_locs.push(ArgLocation::Stack(stack_byte_offset, sz));
                             stack_byte_offset += sz.div_ceil(8) * 8;
                         }
+                    } else if reg_idx < 6 {
+                        arg_locs.push(ArgLocation::Reg1);
+                        reg_idx += 1;
                     } else {
-                        if reg_idx < 8 {
-                            arg_locs.push(ArgLocation::Reg1);
-                            reg_idx += 1;
-                        } else {
-                            arg_locs.push(ArgLocation::Stack(stack_byte_offset, 8));
-                            stack_byte_offset += 8;
-                        }
+                        arg_locs.push(ArgLocation::Stack(stack_byte_offset, 8));
+                        stack_byte_offset += 8;
                     }
                 }
 
                 let total_stack_bytes = stack_byte_offset.div_ceil(16) * 16;
                 if total_stack_bytes > 0 {
-                    if total_stack_bytes <= 4095 {
-                        self.emit(&format!("sub sp, sp, #{}", total_stack_bytes));
-                    } else {
-                        self.emit_load_imm("x16", total_stack_bytes as i64);
-                        self.emit("sub sp, sp, x16");
-                    }
+                    self.emit(&format!("sub rsp, {}", total_stack_bytes));
                     for (arg, loc) in args.iter().zip(arg_locs.iter()) {
                         if let ArgLocation::Stack(off, sz) = loc {
                             self.gen_expr(arg);
                             if arg.ty.is_struct() || arg.ty.is_union() {
                                 if *sz <= 8 {
-                                    self.emit("ldr x0, [x0]");
-                                    self.emit(&format!("str x0, [sp, #{}]", off));
+                                    self.emit("mov rax, [rax]");
+                                    self.emit(&format!("mov [rsp + {}], rax", off));
                                 } else if *sz <= 16 {
-                                    self.emit("ldp x1, x2, [x0]");
-                                    self.emit(&format!("stp x1, x2, [sp, #{}]", off));
+                                    self.emit("mov r10, [rax]");
+                                    self.emit(&format!("mov [rsp + {}], r10", off));
+                                    self.emit("mov r10, [rax + 8]");
+                                    self.emit(&format!("mov [rsp + {}], r10", off + 8));
+                                } else {
+                                    for o in (0..*sz).step_by(8) {
+                                        if o + 8 <= *sz {
+                                            self.emit(&format!("mov r10, [rax + {}]", o));
+                                            self.emit(&format!("mov [rsp + {}], r10", off + o));
+                                        } else {
+                                            let rem = *sz - o;
+                                            for b in 0..rem {
+                                                self.emit(&format!(
+                                                    "mov r10b, byte ptr [rax + {}]",
+                                                    o + b
+                                                ));
+                                                self.emit(&format!(
+                                                    "mov byte ptr [rsp + {}], r10b",
+                                                    off + o + b
+                                                ));
+                                            }
+                                        }
+                                    }
                                 }
                             } else {
-                                self.emit(&format!("str x0, [sp, #{}]", off));
+                                self.emit(&format!("mov [rsp + {}], rax", off));
                             }
                         }
                     }
@@ -1490,65 +1576,54 @@ impl AArch64Emitter {
                         ArgLocation::Reg1 => {
                             self.gen_expr(arg);
                             if arg.ty.is_struct() || arg.ty.is_union() {
-                                self.emit("ldr x0, [x0]");
+                                self.emit("mov rax, [rax]");
                             }
                             self.push();
                             pushed_regs += 1;
                         }
                         ArgLocation::Reg2 => {
                             self.gen_expr(arg);
-                            self.emit("ldp x1, x2, [x0]");
-                            self.emit("str x1, [sp, #-16]!"); // push low 8 bytes first
-                            self.emit("str x2, [sp, #-16]!"); // push high 8 bytes second
+                            self.emit("mov r10, [rax]"); // low 8
+                            self.emit("mov r11, [rax + 8]"); // high 8
+                            self.emit("push r10");
+                            self.emit("push r11");
                             pushed_regs += 2;
                         }
                         ArgLocation::Stack(_, _) => {}
                     }
                 }
 
+                let arg_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
                 for i in (0..pushed_regs).rev() {
-                    self.pop(&format!("x{}", i));
+                    self.pop(arg_regs[i]);
                 }
 
+                self.emit("xor eax, eax"); // AL = 0 (no vector registers for variadic calls)
                 if is_direct {
                     if let TypedExprKind::GlobalVar(name) = &callee.kind {
                         let sym = self.symbol_name(name);
-                        self.emit(&format!("bl {}", sym));
+                        self.emit(&format!("call {}", sym));
                     }
                 } else {
-                    self.pop("x8");
-                    self.emit("blr x8");
+                    self.pop("r10");
+                    self.emit("call r10");
                 }
 
                 if expr.ty.is_struct() || expr.ty.is_union() {
                     let sz = expr.ty.size();
                     let scratch_offset = self.current_func_scratch_offset;
                     if sz <= 8 {
-                        self.emit_store_local("x0", scratch_offset as i32, 8);
-                        if scratch_offset <= 4095 {
-                            self.emit(&format!("sub x0, fp, #{}", scratch_offset));
-                        } else {
-                            self.emit_load_imm("x16", scratch_offset as i64);
-                            self.emit("sub x0, fp, x16");
-                        }
+                        self.emit_store_local("rax", scratch_offset as i32, 8);
+                        self.emit(&format!("lea rax, [rbp - {}]", scratch_offset));
                     } else if sz <= 16 {
-                        self.emit_store_pair_local("x0", "x1", scratch_offset as i32);
-                        if scratch_offset <= 4095 {
-                            self.emit(&format!("sub x0, fp, #{}", scratch_offset));
-                        } else {
-                            self.emit_load_imm("x16", scratch_offset as i64);
-                            self.emit("sub x0, fp, x16");
-                        }
+                        self.emit_store_local("rax", scratch_offset as i32, 8);
+                        self.emit_store_local("rdx", (scratch_offset - 8) as i32, 8);
+                        self.emit(&format!("lea rax, [rbp - {}]", scratch_offset));
                     }
                 }
 
                 if total_stack_bytes > 0 {
-                    if total_stack_bytes <= 4095 {
-                        self.emit(&format!("add sp, sp, #{}", total_stack_bytes));
-                    } else {
-                        self.emit_load_imm("x16", total_stack_bytes as i64);
-                        self.emit("add sp, sp, x16");
-                    }
+                    self.emit(&format!("add rsp, {}", total_stack_bytes));
                 }
             }
             TypedExprKind::StmtExpr(stmts) => {
@@ -1570,13 +1645,14 @@ impl AArch64Emitter {
                     if expr.ty.is_struct() || expr.ty.is_union() {
                         let sz = expr.ty.size();
                         if sz <= 8 {
-                            self.emit("ldr x0, [x0]");
+                            self.emit("mov rax, [rax]");
                         } else if sz <= 16 {
-                            self.emit("ldp x0, x1, [x0]");
+                            self.emit("mov rdx, [rax + 8]");
+                            self.emit("mov rax, [rax]");
                         }
                     }
                 }
-                self.emit(&format!("b .L.return.{}", self.current_func));
+                self.emit(&format!("jmp .L.return.{}", self.current_func));
             }
             TypedStmt::Block(stmts, _) => {
                 for s in stmts {
@@ -1593,16 +1669,16 @@ impl AArch64Emitter {
                 let end_label = self.new_label("if_end");
 
                 self.gen_expr(cond);
-                self.emit("cmp x0, #0");
+                self.emit("test rax, rax");
 
                 if let Some(else_s) = else_stmt {
-                    self.emit(&format!("b.eq {}", else_label));
+                    self.emit(&format!("jz {}", else_label));
                     self.gen_stmt(then_stmt);
-                    self.emit(&format!("b {}", end_label));
+                    self.emit(&format!("jmp {}", end_label));
                     self.emit_label(&else_label);
                     self.gen_stmt(else_s);
                 } else {
-                    self.emit(&format!("b.eq {}", end_label));
+                    self.emit(&format!("jz {}", end_label));
                     self.gen_stmt(then_stmt);
                 }
 
@@ -1617,11 +1693,11 @@ impl AArch64Emitter {
 
                 self.emit_label(&loop_label);
                 self.gen_expr(cond);
-                self.emit("cmp x0, #0");
-                self.emit(&format!("b.eq {}", break_label));
+                self.emit("test rax, rax");
+                self.emit(&format!("jz {}", break_label));
 
                 self.gen_stmt(body);
-                self.emit(&format!("b {}", loop_label));
+                self.emit(&format!("jmp {}", loop_label));
 
                 self.emit_label(&break_label);
                 self.loop_labels.pop();
@@ -1639,8 +1715,8 @@ impl AArch64Emitter {
 
                 self.emit_label(&cond_label);
                 self.gen_expr(cond);
-                self.emit("cmp x0, #0");
-                self.emit(&format!("b.ne {}", loop_label));
+                self.emit("test rax, rax");
+                self.emit(&format!("jnz {}", loop_label));
 
                 self.emit_label(&break_label);
                 self.loop_labels.pop();
@@ -1666,8 +1742,8 @@ impl AArch64Emitter {
                 self.emit_label(&loop_label);
                 if let Some(c) = cond {
                     self.gen_expr(c);
-                    self.emit("cmp x0, #0");
-                    self.emit(&format!("b.eq {}", break_label));
+                    self.emit("test rax, rax");
+                    self.emit(&format!("jz {}", break_label));
                 }
 
                 self.gen_stmt(body);
@@ -1676,7 +1752,7 @@ impl AArch64Emitter {
                 if let Some(s) = step {
                     self.gen_expr(s);
                 }
-                self.emit(&format!("b {}", loop_label));
+                self.emit(&format!("jmp {}", loop_label));
 
                 self.emit_label(&break_label);
                 self.loop_labels.pop();
@@ -1695,25 +1771,20 @@ impl AArch64Emitter {
                 for (val, label) in cases {
                     if is_32bit {
                         let imm = *val as i32;
-                        if (0..=4095).contains(&imm) {
-                            self.emit(&format!("cmp w0, #{}", imm));
-                        } else {
-                            self.emit_load_imm("x1", *val);
-                            self.emit("cmp w0, w1");
-                        }
-                    } else if *val >= 0 && *val <= 4095 {
-                        self.emit(&format!("cmp x0, #{}", val));
+                        self.emit(&format!("cmp eax, {}", imm));
+                    } else if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                        self.emit(&format!("cmp rax, {}", val));
                     } else {
-                        self.emit_load_imm("x1", *val);
-                        self.emit("cmp x0, x1");
+                        self.emit_load_imm("rcx", *val);
+                        self.emit("cmp rax, rcx");
                     }
-                    self.emit(&format!("b.eq {}", label));
+                    self.emit(&format!("je {}", label));
                 }
 
                 if let Some(def_lbl) = default_label {
-                    self.emit(&format!("b {}", def_lbl));
+                    self.emit(&format!("jmp {}", def_lbl));
                 } else {
-                    self.emit(&format!("b {}", break_label));
+                    self.emit(&format!("jmp {}", break_label));
                 }
 
                 self.loop_labels.push((String::new(), break_label.clone()));
@@ -1732,22 +1803,22 @@ impl AArch64Emitter {
             }
             TypedStmt::Break(_) => {
                 if let Some((_, break_lbl)) = self.loop_labels.last() {
-                    self.emit(&format!("b {}", break_lbl));
+                    self.emit(&format!("jmp {}", break_lbl));
                 }
             }
             TypedStmt::Continue(_) => {
                 if let Some((cont_lbl, _)) =
                     self.loop_labels.iter().rev().find(|(c, _)| !c.is_empty())
                 {
-                    self.emit(&format!("b {}", cont_lbl));
+                    self.emit(&format!("jmp {}", cont_lbl));
                 }
             }
             TypedStmt::Goto(lbl, _) => {
-                self.emit(&format!("b .L.user.{}", lbl));
+                self.emit(&format!("jmp .L.user.{}", lbl));
             }
             TypedStmt::GotoExpr(expr, _) => {
                 self.gen_expr(expr);
-                self.emit("br x0");
+                self.emit("jmp rax");
             }
             TypedStmt::Label(lbl, body, _) => {
                 self.emit_label(&format!(".L.user.{}", lbl));
@@ -1763,73 +1834,105 @@ impl AArch64Emitter {
         }
 
         self.current_func = func.name.clone();
+        self.current_func_named_count = func.params.len();
         let sym = self.symbol_name(&func.name);
 
         if !func.is_static {
             writeln!(self.output, ".globl {}", sym).unwrap();
         }
-        writeln!(self.output, ".p2align 2").unwrap();
+        writeln!(self.output, ".p2align 4").unwrap();
         self.emit_label(&sym);
 
         // Prologue
-        self.emit("stp fp, lr, [sp, #-16]!");
-        self.emit("mov fp, sp");
+        self.emit("push rbp");
+        self.emit("mov rbp, rsp");
 
         let raw_stack_size = func.stack_size.max(16);
         let scratch_offset = raw_stack_size.div_ceil(16) * 16 + 16;
-        let stack_size = scratch_offset + 16;
+        let va_offset = scratch_offset + 192;
+        let stack_size = (va_offset + 32).div_ceil(16) * 16;
         self.current_func_scratch_offset = scratch_offset;
+        self.current_func_va_offset = va_offset;
 
-        if stack_size <= 4095 {
-            self.emit(&format!("sub sp, sp, #{}", stack_size));
-        } else {
-            self.emit_load_imm("x16", stack_size as i64);
-            self.emit("sub sp, sp, x16");
+        self.emit(&format!("sub rsp, {}", stack_size));
+
+        if func.is_variadic {
+            self.emit(&format!("mov [rbp - {}], rdi", va_offset));
+            self.emit(&format!("mov [rbp - {}], rsi", va_offset - 8));
+            self.emit(&format!("mov [rbp - {}], rdx", va_offset - 16));
+            self.emit(&format!("mov [rbp - {}], rcx", va_offset - 24));
+            self.emit(&format!("mov [rbp - {}], r8", va_offset - 32));
+            self.emit(&format!("mov [rbp - {}], r9", va_offset - 40));
+            self.emit(&format!("movups [rbp - {}], xmm0", va_offset - 48));
+            self.emit(&format!("movups [rbp - {}], xmm1", va_offset - 64));
+            self.emit(&format!("movups [rbp - {}], xmm2", va_offset - 80));
+            self.emit(&format!("movups [rbp - {}], xmm3", va_offset - 96));
+            self.emit(&format!("movups [rbp - {}], xmm4", va_offset - 112));
+            self.emit(&format!("movups [rbp - {}], xmm5", va_offset - 128));
+            self.emit(&format!("movups [rbp - {}], xmm6", va_offset - 144));
+            self.emit(&format!("movups [rbp - {}], xmm7", va_offset - 160));
         }
 
         // Save incoming argument registers into their stack slots
+        let arg_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
         let mut reg_idx = 0;
         let mut stack_arg_offset = 16;
+
         for param in &func.params {
             let offset = param.offset;
             if param.ty.is_struct() || param.ty.is_union() {
                 let sz = param.ty.size();
                 if sz <= 8 {
-                    if reg_idx < 8 {
-                        self.emit_store_local(&format!("x{}", reg_idx), offset, sz);
+                    if reg_idx < 6 {
+                        self.emit_store_local(arg_regs[reg_idx], offset, sz);
                         reg_idx += 1;
                     } else {
-                        self.emit(&format!("ldr x16, [fp, #{}]", stack_arg_offset));
-                        self.emit_store_local("x16", offset, sz);
+                        self.emit(&format!("mov r10, [rbp + {}]", stack_arg_offset));
+                        self.emit_store_local("r10", offset, sz);
                         stack_arg_offset += 8;
                     }
                 } else if sz <= 16 {
-                    if reg_idx <= 6 {
-                        self.emit_store_pair_local(
-                            &format!("x{}", reg_idx),
-                            &format!("x{}", reg_idx + 1),
-                            offset,
-                        );
+                    if reg_idx <= 4 {
+                        self.emit_store_local(arg_regs[reg_idx], offset, 8);
+                        self.emit_store_local(arg_regs[reg_idx + 1], offset - 8, 8);
                         reg_idx += 2;
                     } else {
-                        reg_idx = 8;
-                        self.emit(&format!("ldp x16, x17, [fp, #{}]", stack_arg_offset));
-                        self.emit_store_pair_local("x16", "x17", offset);
+                        reg_idx = 6;
+                        self.emit(&format!("mov r10, [rbp + {}]", stack_arg_offset));
+                        self.emit_store_local("r10", offset, 8);
+                        self.emit(&format!("mov r10, [rbp + {}]", stack_arg_offset + 8));
+                        self.emit_store_local("r10", offset - 8, 8);
                         stack_arg_offset += 16;
                     }
                 } else {
-                    self.emit(&format!("ldr x16, [fp, #{}]", stack_arg_offset));
-                    self.emit_store_local("x16", offset, 8);
+                    for o in (0..sz).step_by(8) {
+                        if o + 8 <= sz {
+                            self.emit(&format!("mov r10, [rbp + {}]", stack_arg_offset + o));
+                            self.emit(&format!("mov [rbp - {}], r10", offset as usize - o));
+                        } else {
+                            let rem = sz - o;
+                            for b in 0..rem {
+                                self.emit(&format!(
+                                    "mov r10b, byte ptr [rbp + {}]",
+                                    stack_arg_offset + o + b
+                                ));
+                                self.emit(&format!(
+                                    "mov byte ptr [rbp - {}], r10b",
+                                    offset as usize - o - b
+                                ));
+                            }
+                        }
+                    }
                     stack_arg_offset += sz.div_ceil(8) * 8;
                 }
             } else {
                 let sz = param.ty.size();
-                if reg_idx < 8 {
-                    self.emit_store_local(&format!("x{}", reg_idx), offset, sz);
+                if reg_idx < 6 {
+                    self.emit_store_local(arg_regs[reg_idx], offset, sz);
                     reg_idx += 1;
                 } else {
-                    self.emit(&format!("ldr x16, [fp, #{}]", stack_arg_offset));
-                    self.emit_store_local("x16", offset, sz);
+                    self.emit(&format!("mov r10, [rbp + {}]", stack_arg_offset));
+                    self.emit_store_local("r10", offset, sz);
                     stack_arg_offset += 8;
                 }
             }
@@ -1844,8 +1947,8 @@ impl AArch64Emitter {
 
         // Epilogue
         self.emit_label(&format!(".L.return.{}", func.name));
-        self.emit("mov sp, fp");
-        self.emit("ldp fp, lr, [sp], #16");
+        self.emit("mov rsp, rbp");
+        self.emit("pop rbp");
         self.emit("ret");
         writeln!(self.output).unwrap();
     }
@@ -2031,9 +2134,11 @@ impl AArch64Emitter {
     }
 }
 
-impl TargetEmitter for AArch64Emitter {
+impl TargetEmitter for X86_64Emitter {
     fn emit_program(&mut self, prog: &TypedProgram) -> String {
         self.output.clear();
+        writeln!(self.output, ".intel_syntax noprefix").unwrap();
+
         self.defined_globals = prog
             .globals
             .iter()
@@ -2060,7 +2165,6 @@ impl TargetEmitter for AArch64Emitter {
 
         // Global variables
         if !prog.globals.is_empty() {
-            // Deduplicate globals: skip extern, prefer definitions with initializers
             let mut unique_globals: HashMap<&str, &GlobalVarInfo> = HashMap::new();
             for g in &prog.globals {
                 if g.is_extern {
